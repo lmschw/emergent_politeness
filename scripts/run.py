@@ -4,7 +4,7 @@ Examples:
     uv run python scripts/run.py --seeds 8 --days 20                 # condition 0
     uv run python scripts/run.py --condition 1 --days 50 --burn-in 30
     uv run python scripts/run.py --set world.food_regrowth=0.03 --set tasks.food_per_capita=4
-    uv run python scripts/run.py --condition 4 --sweep social.refuse_bias=-3,-4,-5
+    uv run python scripts/run.py --condition 4 --sweep social.exploration_bias=-2,-3,-4
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ SHOW_SOCIAL = [
     "gives_per_day", "refusals_per_day", "attacks_per_day", "attacks_refused_per_day", "attacks_patch_per_day",
     "attacks_grudge_per_day", "attacker_win_rate", "fight_death_share", "linearity_h", "linearity_chance", "n_fighters",
     "corr_selfstatus_strength", "corr_perceived_status_strength", "status_agreement", "mean_memory_size",
-    *[f"expect_{n}_{b}" for n in ("win", "refuse", "attack") for b in ("below", "level", "above", "unknown")],
+    "weight_spread_between_agents", "imitations_per_day",
+    *[f"expect_{n}_{b}" for n in ("win", "refuse", "attack", "give") for b in ("below", "level", "above", "unknown")],
 ]
 
 
@@ -62,7 +63,8 @@ def run_one(args: tuple[list[str], float, int, float, str]) -> dict:
 
 def report(label: str, results: list[dict]) -> None:
     print(f"\n== {label}  ({len(results)} seeds)")
-    for key in SHOW + (SHOW_SOCIAL if "gives_per_day" in results[0] else []):
+    learned = sorted(k for k in results[0] if k.startswith("w_"))
+    for key in SHOW + (SHOW_SOCIAL + learned if "gives_per_day" in results[0] else []):
         vals = np.array([r.get(key, np.nan) for r in results], dtype=float)
         print(f"  {key:28s} {np.nanmean(vals):9.3f}  ± {np.nanstd(vals):7.3f}")
 

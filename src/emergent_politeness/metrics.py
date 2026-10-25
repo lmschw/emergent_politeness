@@ -148,6 +148,7 @@ def social_summary(sim, burn_in_days: float = 2.0) -> dict:
         "attacks_grudge_per_day": reasons["grudge"] / days_kept,
         "attacker_win_rate": float(np.mean([r["actor_won"] for r in attacks])) if attacks else float("nan"),
         "fight_death_share": (sum(d["cause"] == "fight" for d in deaths) / len(deaths)) if deaths else float("nan"),
+        "imitations_per_day": sum(1 for r in sim.log.of_kind("imitate") if r["step"] >= start) / days_kept,
         "linearity_h": h,
         "linearity_chance": 3 / (n_fighters + 1) if n_fighters >= 3 else float("nan"),
         "n_fighters": n_fighters,
@@ -168,8 +169,20 @@ def social_summary(sim, burn_in_days: float = 2.0) -> dict:
             pm, st = np.array(pairs).T
             out["corr_perceived_status_strength"] = float(np.corrcoef(pm, st)[0, 1]) if pm.std() > 0 else float("nan")
         out["mean_memory_size"] = float(np.mean([len(a["memory"]) for a in last["agents"].values()]))
+        # What agents have learned about consequences (spec §5.3d): mean advantage weight per feature,
+        # and how much agents differ (mean SD across agents; low = a shared norm)
+        from .learning import FEATURES
+        spreads = []
+        for act, names in FEATURES.items():
+            ws = np.array([a["advantage"][act] for a in last["agents"].values() if a.get("advantage")])
+            if len(ws):
+                for n_, name in enumerate(names):
+                    out[f"w_{act}_{name}"] = float(ws[:, n_].mean())
+                spreads.append(ws.std(axis=0).mean())
+        if spreads:
+            out["weight_spread_between_agents"] = float(np.mean(spreads))
         # What agents have learned about status (spec §5.3a): mean over living agents
-        for name in ("win", "refuse", "attack"):
+        for name in ("win", "refuse", "attack", "give"):
             tables = np.array([a["expect"][name] for a in last["agents"].values() if a.get("expect")])
             if len(tables):
                 for b, label in enumerate(("below", "level", "above", "unknown")):

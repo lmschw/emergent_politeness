@@ -59,6 +59,8 @@ class Agent:
     acceptance: float = 0.0  # Â
     memory: dict = field(default_factory=dict)  # other id -> social.Impression
     expect: dict = field(default_factory=dict)  # learned status expectations, see social.Opinions
+    qmodels: dict = field(default_factory=dict)  # learned returns of acts, see learning.ConsequenceLearner
+    welfare: float = 0.0  # running total of material returns (store food, gifts, refusals, damage)
     refused_until: int = -1  # cannot ask to enter again before this step
     refused_by: int | None = None
     refused_at: int = -10**9

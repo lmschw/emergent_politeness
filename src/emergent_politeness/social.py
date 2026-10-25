@@ -29,7 +29,7 @@ from .config import SocialParams
 
 BELOW, LEVEL, ABOVE, UNKNOWN = 0, 1, 2, 3  # actor's status relative to the target, as someone perceives it
 BIN_LABELS = ("below", "level", "above", "unknown")
-EXPECTATIONS = ("win", "refuse", "attack")
+EXPECTATIONS = ("win", "refuse", "attack", "give")
 
 
 @dataclass(slots=True)
@@ -166,6 +166,12 @@ class Opinions:
             return
         self.learn(observer, "refuse", b, float(refused))
 
+    def observe_gift_opportunity(self, observer: Agent, giver: Agent, target: Agent, gave: bool, b: int) -> None:
+        """Learn how often someone in configuration b (giver vs hungry neighbour) gives (spec §5.3c)."""
+        if observer is not giver and observer is not target and self.rng.random() >= self.p.attention:
+            return
+        self.learn(observer, "give", b, float(gave))
+
     def observe_retaliation(self, observer: Agent, b: int, attacked: bool) -> None:
         """Learn how often a refused agent in configuration b (refused vs guard) attacks."""
         self.learn(observer, "attack", b, float(attacked))
@@ -209,6 +215,21 @@ class Opinions:
             imp.P = clip1(imp.P + self.p.contribution_P * danger)
         else:
             imp.L += self.p.ledger_contribution * value
+
+    # --- status as a positional good (spec §5.3b) ------------------------
+    def recenter(self, agent: Agent) -> None:
+        """Shift the agent's perceived statuses of everyone it knows, and its self-status, so that
+        they average zero: someone rising in its eyes means everyone else, itself included, falling
+        (Frank 1985; social comparison, Festinger 1954)."""
+        if not agent.memory:
+            return
+        total = agent.self_status + sum(imp.P for imp in agent.memory.values())
+        shift = total / (len(agent.memory) + 1)
+        if abs(shift) < 1e-12:
+            return
+        agent.self_status = clip1(agent.self_status - shift)
+        for imp in agent.memory.values():
+            imp.P = clip1(imp.P - shift)
 
     # --- per-step decay ------------------------------------------------
     def decay(self, agent: Agent) -> None:

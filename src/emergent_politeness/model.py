@@ -16,6 +16,7 @@ from .config import Config
 from .environment import FOOD, MATERIAL, Environment, Patch
 from .events import EventLog
 from .physics import PhysicsWorld
+from .learning import ConsequenceLearner
 from .social import Opinions, sigmoid
 
 
@@ -67,6 +68,7 @@ class Simulation:
         # Stage 2: social acts and opinions. Nothing here touches the RNG in condition 0.
         self.acts_on = c.physical_acts
         self.opinions = Opinions(config.social, c.affect, self.rng) if (c.physical_acts or c.language) else None
+        self.learner = ConsequenceLearner(config.social, self.opinions) if c.physical_acts else None
         self.snapshots: list[dict] = []  # daily opinion snapshots for analysis
         # Refusals awaiting a possible retaliation: (arriver, guard) -> (deadline step, [(observer, bin)])
         self._pending_retaliation: dict[tuple[int, int], tuple[int, list]] = {}
@@ -95,6 +97,8 @@ class Simulation:
         self._next_id += 1
         if self.opinions is not None:
             a.expect = self.opinions.new_expectations()
+        if self.learner is not None:
+            a.qmodels = self.learner.new_models()
         self.agents[a.id] = a
         self.physics.add_agent(a.id, pos)
         a.inside = self.env.shelter.contains(pos)
@@ -305,6 +309,7 @@ class Simulation:
         b, sh = self.cfg.body, self.env.shelter
         if a.inside and sh.food >= 1:
             sh.food -= 1
+            a.welfare += self.cfg.social.welfare_store_food
             source = "store"
         elif a.rations > 0:
             a.rations -= 1
@@ -376,6 +381,7 @@ class Simulation:
             if a.inside and a.rations < self.cfg.body.max_rations and sh.food >= 1:
                 sh.food -= 1
                 a.rations += 1
+                a.welfare += self.cfg.social.welfare_store_food
                 self.log.log(self.k, "take_ration", agent=a.id)
         elif task in (Task.MAINTAIN, Task.BUILD):
             a.phase = Phase.WORK if a.inside else Phase.OUTBOUND
@@ -538,17 +544,21 @@ class Simulation:
         crowding = self.n_inside / max(1, sh.capacity)
         for i in self.rng.permutation(len(guards)):
             g = guards[i]
-            liking, risk = op.liking(g, a.id), op.refusal_risk(g, a.id)
-            x = sp.refuse_bias - sp.refuse_liking * liking + sp.refuse_crowding * crowding - sp.refuse_risk * risk
-            refused = self.rng.random() < sigmoid(x)
-            self.log.log(self.k, "entry_check", guard=g.id, agent=a.id, liking=round(liking, 4),
-                         status_gap=round(g.self_status - op.status(g, a.id), 4), risk=round(risk, 4),
-                         crowding=round(crowding, 4), refused=refused)
+            carries = 1.0 if (a.load_kind == FOOD and a.load >= 1) else 0.0
+            f = self.learner.features(g, a, "refuse", (carries, a.hunger, crowding))
+            adv = self.learner.advantage(g, "refuse", f)
+            refused = self.rng.random() < sigmoid(sp.exploration_bias + sp.choice_gain * adv)
+            self.learner.record(g, "refuse", f, refused, self.k)
+            self.log.log(self.k, "entry_check", guard=g.id, agent=a.id, liking=round(op.liking(g, a.id), 4),
+                         status_gap=round(g.self_status - op.status(g, a.id), 4),
+                         risk=round(op.refusal_risk(g, a.id), 4), crowding=round(crowding, 4),
+                         carries=carries, advantage=round(adv, 4), refused=refused)
             observers = self._observers(g, a)
             # Status configurations as each observer saw them *before* the decision (spec §5.3a).
             bins_refuse = [op.bin(o, g.id, a.id) for o in observers]
             bins_avenge = [op.bin(o, a.id, g.id) for o in observers]
             if refused:
+                a.welfare += sp.welfare_refused
                 a.refused_until = self.k + sp.refusal_cooldown
                 a.refused_by, a.refused_at = g.id, self.k
                 if not a.waiting_at_door:
@@ -590,10 +600,17 @@ class Simulation:
                 acted.update((a.id, target.id))
                 self._fight(a, target, reason)
                 continue
-            target = self._give_choice(a, near)
-            if target is not None:
+            choice = self._give_choice(a, near)
+            if choice is None:
+                continue
+            target, gave = choice
+            context = self._gift_context(a, target) if self.cfg.social.gift_status else None
+            if gave:
                 acted.add(a.id)
-                self._give(a, target)
+                self._give(a, target, context)
+            if context is not None:  # learn after appraising, from expectations held before the gift
+                for o, b in zip(*context):
+                    self.opinions.observe_gift_opportunity(o, a, target, gave, b)
 
     def _attack_choice(self, a: Agent, near: list[Agent], harvesters, acted) -> tuple[Agent, str] | None:
         sp, op = self.cfg.social, self.opinions
@@ -613,10 +630,11 @@ class Simulation:
                     candidates.append((t, "grudge"))
                     break
         for t, reason in candidates:
-            x = (sp.attack_bias - sp.attack_liking * op.liking(a, t.id)
-                 + sp.attack_expected_win * (2 * op.expected_win(a, a.id, t.id) - 1)
-                 + sp.attack_hunger * a.hunger + sp.attack_transient * max(0.0, -op.transient_e(a, t.id)))
-            if self.rng.random() < sigmoid(x):
+            f = self.learner.features(a, t, "attack", (2 * op.expected_win(a, a.id, t.id) - 1, a.hunger))
+            adv = self.learner.advantage(a, "attack", f)
+            chosen = self.rng.random() < sigmoid(sp.exploration_bias + sp.choice_gain * adv)
+            self.learner.record(a, "attack", f, chosen, self.k)
+            if chosen:
                 return t, reason
         return None
 
@@ -630,6 +648,8 @@ class Simulation:
         winner, loser = (a, t) if a_wins else (t, a)
         loser.health -= sp.fight_damage
         winner.health -= sp.winner_damage_frac * sp.fight_damage
+        loser.welfare += sp.welfare_damage
+        winner.welfare += sp.welfare_damage * sp.winner_damage_frac
         loser.last_damage = winner.last_damage = "fight"
         value = sp.v_attack_win if a_wins else sp.v_attack_lose
         observers = self._observers(a, t)
@@ -646,18 +666,26 @@ class Simulation:
         if reason == "refused":  # winning the fight settles whether the door opens
             a.refused_until = self.k if a_wins else self.k + sp.refusal_cooldown
 
-    def _give_choice(self, a: Agent, near: list[Agent]) -> Agent | None:
+    def _gift_context(self, a: Agent, t: Agent) -> tuple[list[Agent], list[int]]:
+        """Observers of a gift opportunity and their status configuration (giver vs target), taken before."""
+        observers = self._observers(a, t)
+        return observers, [self.opinions.bin(o, a.id, t.id) for o in observers]
+
+    def _give_choice(self, a: Agent, near: list[Agent]) -> tuple[Agent, bool] | None:
+        """A visibly hungry neighbour is a gift opportunity: return (target, whether a gift is made)."""
         sp = self.cfg.social
         food = a.rations + (int(a.load) if a.load_kind == FOOD else 0)
         hungry = [t for t in near if t.hunger > sp.hungry_visible]
         if food < 1 or not hungry:
             return None
         t = max(hungry, key=lambda x: x.hunger)
-        x = (sp.give_bias + sp.give_liking * self.opinions.liking(a, t.id)
-             + sp.give_need * t.hunger - sp.give_own_hunger * a.hunger)
-        return t if self.rng.random() < sigmoid(x) else None
+        f = self.learner.features(a, t, "give", (t.hunger,))
+        adv = self.learner.advantage(a, "give", f)
+        gave = self.rng.random() < sigmoid(sp.exploration_bias - sp.give_own_hunger * a.hunger + sp.choice_gain * adv)
+        self.learner.record(a, "give", f, gave, self.k)
+        return t, gave
 
-    def _give(self, a: Agent, t: Agent) -> None:
+    def _give(self, a: Agent, t: Agent, context: tuple[list[Agent], list[int]] | None = None) -> None:
         sp = self.cfg.social
         if a.load_kind == FOOD and a.load >= 1:
             a.load -= 1
@@ -666,7 +694,31 @@ class Simulation:
             a.rations -= 1
             source = "ration"
         t.rations += 1
-        self._act(a, t, "give", sp.v_give, sp.ledger_give, source=source)
+        a.welfare -= sp.welfare_gift
+        t.welfare += sp.welfare_gift
+        if sp.gift_status:  # option B: the gift asserts standing; its weight depends on its surprise
+            value = (sp.v_give[0], sp.gift_status_value)
+            self._act(a, t, "give", value, sp.ledger_give, appraise="give", observers=list(context[0]), source=source)
+        else:
+            self._act(a, t, "give", sp.v_give, sp.ledger_give, source=source)
+
+    def _social_learning(self) -> None:
+        """Payoff-biased copying of learned weights (spec §5.3e): now and then an agent looks at a random
+        agent in view and imitates it if it is visibly doing better."""
+        sp = self.cfg.social
+        ids = list(self.agents)
+        for n in self.rng.permutation(len(ids)):
+            a = self.agents[ids[n]]
+            if self.rng.random() >= sp.copy_rate:
+                continue
+            pa = self.physics.position(a.id)
+            in_view = [o for o in self.agents.values()
+                       if o is not a and dist(self.physics.position(o.id), pa) < sp.r_see]
+            if not in_view:
+                continue
+            model = in_view[int(self.rng.integers(len(in_view)))]
+            if self.learner.imitate(a, model, self.rng):
+                self.log.log(self.k, "imitate", agent=a.id, model=model.id)
 
     def _contribution_seen(self, a: Agent) -> None:
         """Delivering to the store is visible work (spec §5.2): u = s_τ·(1 + d_τ)."""
@@ -685,6 +737,7 @@ class Simulation:
                     "acceptance": a.acceptance,
                     "strength": a.strength,
                     "expect": {name: list(v) for name, v in a.expect.items()},
+                    "advantage": {act: list(w[0] - w[1]) for act, w in a.qmodels.items()},
                     "memory": {j: (op.liking(a, j), imp.P, imp.F) for j, imp in a.memory.items()},
                 }
                 for a in self.agents.values()
@@ -732,6 +785,9 @@ class Simulation:
         if self.acts_on:
             self._social_acts()
             self._resolve_retaliation()
+            self.learner.resolve(self.k)
+            if self.cfg.social.social_learning:
+                self._social_learning()
             self._remove_dead()
         stimuli = self._stimuli_now = self._stimuli()
         for aid in self.rng.permutation(list(self.agents)):
@@ -742,6 +798,8 @@ class Simulation:
         if self.opinions is not None:
             for a in self.agents.values():
                 self.opinions.decay(a)
+                if self.cfg.social.relative_status:
+                    self.opinions.recenter(a)
             if self.k % self.cfg.world.day_length == 0:
                 self._snapshot()
         self._record(cold)

@@ -100,7 +100,7 @@ def test_transients_decay():
 
 
 def test_hostile_guards_keep_capacity_and_log_refusals():
-    cfg = Config(condition=CONDITIONS["1"]).with_(social={"refuse_bias": 5.0})
+    cfg = Config(condition=CONDITIONS["1"]).with_(social={"exploration_bias": 5.0})
     sim = Simulation(cfg).run(1500)
     assert np.array(sim.series["n_inside"]).max() <= max(sim.series["capacity"])
     refusals = [r for r in sim.log.of_kind("act") if r["act"] == "refuse_entry"]
@@ -182,3 +182,89 @@ def test_strangers_are_unknown_not_level():
     assert op.bin(viewer, 1, 2) == LEVEL  # both known, no perceived difference
     assert op.bin(viewer, 0, 1) == LEVEL  # the viewer always knows itself
     assert op.bin(viewer, 0, 7) == UNKNOWN
+
+
+def test_relative_status_is_zero_sum_including_self():
+    op = opinions(affect=False)
+    me, x, y = agent(0), agent(1), agent(2)
+    op.recall(me, 1, 0).P = 0.6  # x just rose in my eyes
+    op.recall(me, 2, 0).P = 0.0
+    op.recenter(me)
+    total = me.self_status + me.memory[1].P + me.memory[2].P
+    assert total == pytest.approx(0.0)
+    assert me.memory[2].P < 0 and me.self_status < 0  # everyone else, me included, fell
+    assert me.memory[1].P - me.memory[2].P == pytest.approx(0.6)  # differences are kept
+
+
+def test_gift_status_toggle():
+    """Off: gifts are never appraised by status configuration, so the 'give' expectations stay at the prior."""
+    off = Simulation(Config(condition=CONDITIONS["4"]).with_(social={"gift_status": False})).run(9000)
+    on = Simulation(Config(condition=CONDITIONS["4"]).with_(social={"gift_status": True})).run(9000)
+    assert any(r["act"] == "give" for r in off.log.of_kind("act"))
+    assert all(v == 0.5 for a in off.agents.values() for v in a.expect["give"])
+    assert any(v != 0.5 for a in on.agents.values() for v in a.expect["give"])
+
+
+def test_gift_raises_givers_standing_when_unexpected():
+    op = opinions(affect=True)
+    giver, receiver = agent(0), agent(1)
+    receiver.expect["give"] = [0.0] * 4  # gifts are never expected
+    op.observe_act(receiver, giver, receiver, (0.6, 0.2), ledger=1.0, k=0, act="give")
+    assert receiver.memory[0].P > 0 and receiver.self_status < 0  # indebted to the giver (Mauss)
+    jaded = agent(2)
+    jaded.expect["give"] = [1.0] * 4  # gifts always expected: no effect
+    op.observe_act(jaded, giver, jaded, (0.6, 0.2), ledger=1.0, k=0, act="give")
+    assert jaded.memory[0].P == 0 and jaded.memory[0].E == 0
+
+
+def test_gift_opportunities_are_learned():
+    op = opinions(affect=True)
+    o, giver, hungry = agent(0), agent(1), agent(2)
+    for _ in range(50):
+        op.observe_gift_opportunity(o, giver, hungry, gave=False, b=LEVEL)
+    assert o.expect["give"][LEVEL] < 0.05 and o.expect["give"][ABOVE] == 0.5
+
+
+def test_learner_moves_chosen_prediction_toward_return():
+    from emergent_politeness.learning import ConsequenceLearner
+    p = SocialParams(return_window=10, return_rate=0.5)
+    op = Opinions(p, True, np.random.default_rng(0))
+    learner = ConsequenceLearner(p, op)
+    giver, hungry = agent(0), agent(1)
+    giver.alive = True
+    giver.qmodels = learner.new_models()
+    f = learner.features(giver, hungry, "give", (0.9,))
+    assert f[UNKNOWN] == 1.0 and f[:4].sum() == 1.0  # one-hot status configuration: a stranger
+    for _ in range(30):  # giving is always followed by a net gain of 2 food units
+        learner.record(giver, "give", f, True, k=0)
+        giver.welfare += 2.0
+        learner.resolve(k=10)
+    assert learner.advantage(giver, "give", f) > 1.5  # acting predicted ~2 better than not acting (0)
+
+
+def test_no_fixed_sign_social_terms_left():
+    """Audit guard: the removed disposition weights must not come back (docs/assumptions_audit.md)."""
+    removed = ("give_liking", "give_need", "refuse_liking", "refuse_crowding", "refuse_risk",
+               "attack_liking", "attack_expected_win", "attack_hunger", "attack_transient",
+               "give_bias", "refuse_bias", "attack_bias")  # act-specific propensities removed too
+    params = SocialParams.__dataclass_fields__
+    assert not [name for name in removed if name in params]
+
+
+def test_imitation_only_copies_from_better_off_agents():
+    from emergent_politeness.learning import ConsequenceLearner
+    p = SocialParams(copy_strength=0.5)
+    learner = ConsequenceLearner(p, Opinions(p, True, np.random.default_rng(0)))
+    me, better, worse = agent(0), agent(1), agent(2)
+    for a in (me, better, worse):
+        a.qmodels = learner.new_models()
+    better.qmodels["give"][0][4] = 1.0  # the better-off agent has learned that giving to liked agents pays
+    worse.qmodels["give"][0][4] = -1.0
+    me.health, me.hunger = 0.5, 0.5
+    better.health, better.hunger = 1.0, 0.0
+    worse.health, worse.hunger = 0.2, 0.9
+    rng = np.random.default_rng(1)
+    assert not learner.imitate(me, worse, rng)  # never copy someone doing worse
+    assert me.qmodels["give"][0][4] == 0.0
+    assert learner.imitate(me, better, rng)  # gap 0.75: copied with probability 0.75 (this draw copies)
+    assert me.qmodels["give"][0][4] == pytest.approx(0.5)

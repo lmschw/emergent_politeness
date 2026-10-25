@@ -2,11 +2,13 @@
 
     uv run python scripts/plot_stage2.py --seeds 8 --days 50
     uv run python scripts/plot_stage2.py --reuse   # replot from cached results in runs/
+    uv run python scripts/plot_stage2.py --social gift_status=true --out figures/stage2_gift_status
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -31,6 +33,10 @@ def run_one(args: tuple[str, int, float, dict]) -> dict:
         cfg = cfg.with_(social=social)
     sim = Simulation(cfg).run()
     last = sim.snapshots[-1] if sim.snapshots else None
+    weights_daily = []
+    for snap in sim.snapshots:
+        ws = [a["advantage"] for a in snap["agents"].values() if a.get("advantage")]
+        weights_daily.append({act: np.mean([w[act] for w in ws], axis=0) for act in ws[0]} if ws else None)
     return {
         "cond": cond, "seed": seed, "social": social, "day": cfg.world.day_length,
         "n": np.asarray(sim.series["n"]), "cold": np.asarray(sim.series["cold"]),
@@ -39,6 +45,7 @@ def run_one(args: tuple[str, int, float, dict]) -> dict:
         "checks": [(r["step"], r["liking"], r["status_gap"], r["crowding"], r["refused"], r.get("risk", np.nan))
                    for r in sim.log.of_kind("entry_check")],
         "snapshot": last,
+        "weights_daily": weights_daily,
     }
 
 
@@ -53,7 +60,7 @@ def per_day(events_steps, day: int, days: float, binw: float = 2.0):
 def fig_population_deaths(R: list[dict], out: Path, days: float) -> None:
     fig, (ax, bx) = plt.subplots(1, 2, figsize=(12, 4.2), constrained_layout=True, gridspec_kw={"width_ratios": [1.6, 1]})
     for cond in ("0", "1", "4"):
-        runs = [r for r in R if r["cond"] == cond and not r["social"]]
+        runs = [r for r in R if r["cond"] == cond]
         t = np.arange(len(runs[0]["n"])) / runs[0]["day"]
         m = np.mean([r["n"] for r in runs], axis=0)
         ax.plot(t, m, color=COND_COLOR[cond], lw=LW, label=COND_LABEL[cond])
@@ -70,7 +77,7 @@ def fig_population_deaths(R: list[dict], out: Path, days: float) -> None:
     for ci, cause in enumerate(CAUSES):
         vals = []
         for cond in conds:
-            runs = [r for r in R if r["cond"] == cond and not r["social"]]
+            runs = [r for r in R if r["cond"] == cond]
             n = sum(1 for r in runs for st, c in r["deaths"] if c == cause and st >= WINDOW * r["day"])
             vals.append(n / len(runs) / (days - WINDOW))
         bx.bar(range(len(conds)), vals, bottom=bottoms, color=SLOT[ci], width=0.6, label=cause,
@@ -90,7 +97,7 @@ def fig_act_rates(R: list[dict], out: Path, days: float) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(13, 3.8), constrained_layout=True, sharex=True)
     for ax, act, title in zip(axes, ("give", "refuse_entry", "attack"), ("Gifts", "Entry refusals", "Attacks")):
         for cond in ("1", "4"):
-            runs = [r for r in R if r["cond"] == cond and not r["social"]]
+            runs = [r for r in R if r["cond"] == cond]
             rates = [per_day([st for st, a, *_ in r["acts"] if a == act], r["day"], days)[1] for r in runs]
             x = per_day([], runs[0]["day"], days)[0]
             ax.plot(x, np.mean(rates, axis=0), color=COND_COLOR[cond], lw=LW, label=COND_LABEL[cond])
@@ -120,7 +127,7 @@ def fig_daily_cycle(R: list[dict], out: Path) -> None:
     axes[0].set_title("Cold over the day cycle")
     for ax, act, title in zip(axes[1:], ("refuse_entry", "attack"), ("Entry refusals", "Attacks")):
         for cond in ("1", "4"):
-            runs = [r for r in R if r["cond"] == cond and not r["social"]]
+            runs = [r for r in R if r["cond"] == cond]
             c = np.zeros(nb)
             for r in runs:
                 for st, a, *_ in r["acts"]:
@@ -159,7 +166,7 @@ def fig_refusal_inputs(R: list[dict], out: Path) -> None:
              (3, np.linspace(0, 1, 11), "crowding (agents inside / capacity)")]
     for ax, (col, edges, label) in zip(axes, specs):
         for cond in ("1", "4"):
-            rows = np.array([c for r in R if r["cond"] == cond and not r["social"] for c in r["checks"]], dtype=float)
+            rows = np.array([c for r in R if r["cond"] == cond for c in r["checks"]], dtype=float)
             x, rate, _ = binned_rate(rows[:, col], rows[:, 4], edges)
             ax.plot(x, rate, color=COND_COLOR[cond], lw=LW, marker="o", ms=4, label=COND_LABEL[cond])
         ax.set_xlabel(label)
@@ -172,15 +179,18 @@ def fig_refusal_inputs(R: list[dict], out: Path) -> None:
 
 def fig_expectations(R: list[dict], out: Path) -> None:
     """What agents learned about status (spec §5.3a): mean expectation per configuration."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.1), constrained_layout=True)
+    names = ["win", "refuse", "attack"] + (["give"] if any(
+        r["snapshot"] and any("give" in a.get("expect", {}) for a in r["snapshot"]["agents"].values()) for r in R) else [])
+    fig, axes = plt.subplots(1, len(names), figsize=(5 * len(names), 4.1), constrained_layout=True)
     titles = {"win": "p̂ win: someone in this position wins a fight",
               "refuse": "p̂ refuse: a guard in this position refuses",
-              "attack": "p̂ attack: a refused agent in this position attacks"}
+              "attack": "p̂ attack: a refused agent in this position attacks",
+              "give": "p̂ give: someone with food here gives to a hungry agent"}
     labels = ["actor below\ntarget", "level", "actor above\ntarget", "unknown\n(stranger)"]
     width = 0.36
-    for ax, name in zip(axes, ("win", "refuse", "attack")):
+    for ax, name in zip(axes, names):
         for i, cond in enumerate(("1", "4")):
-            tables = np.array([a["expect"][name] for r in R if r["cond"] == cond and not r["social"] and r["snapshot"]
+            tables = np.array([a["expect"][name] for r in R if r["cond"] == cond and r["snapshot"]
                                for a in r["snapshot"]["agents"].values() if a.get("expect")])
             m = tables.mean(axis=0)
             ax.bar(np.arange(4) + (i - 0.5) * width, m, width=width - 0.04, color=COND_COLOR[cond],
@@ -193,7 +203,7 @@ def fig_expectations(R: list[dict], out: Path) -> None:
     axes[0].set_ylabel("mean learned expectation (day 60, all agents)")
     axes[0].legend(loc="upper left")
     axes[0].text(3.4, 0.51, "prior 0.5", color=MUTED, fontsize=8, ha="right", va="bottom")
-    fig.savefig(out / "8_learned_expectations.png", dpi=130)
+    fig.savefig(out / "9_learned_expectations.png", dpi=130)
     plt.close(fig)
 
 
@@ -202,7 +212,7 @@ def fig_status_strength(R: list[dict], out: Path) -> None:
     for col, cond in enumerate(("1", "4")):
         k, S, Pm = [], [], []
         for r in R:
-            if r["cond"] != cond or r["social"] or r["snapshot"] is None:
+            if r["cond"] != cond or r["snapshot"] is None:
                 continue
             snap = r["snapshot"]["agents"]
             perceived = defaultdict(list)
@@ -231,7 +241,7 @@ def fig_liking(R: list[dict], out: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
     edges = np.linspace(-1, 1, 41)
     for cond in ("1", "4"):
-        vals = [lik for r in R if r["cond"] == cond and not r["social"] and r["snapshot"]
+        vals = [lik for r in R if r["cond"] == cond and r["snapshot"]
                 for obs in r["snapshot"]["agents"].values() for (lik, _, _) in obs["memory"].values()]
         hist, _ = np.histogram(vals, bins=edges, density=True)
         ax.step(edges[:-1], hist, where="post", color=COND_COLOR[cond], lw=LW, label=f"{COND_LABEL[cond]} ({len(vals)} pairs)")
@@ -243,26 +253,54 @@ def fig_liking(R: list[dict], out: Path) -> None:
     plt.close(fig)
 
 
-def fig_feud_spiral(R: list[dict], out: Path, days: float) -> None:
-    fig, ax = plt.subplots(figsize=(10, 4.2), constrained_layout=True)
-    biases = sorted({r["social"].get("refuse_bias") for r in R if r["social"]}, reverse=True)
-    for i, bias in enumerate(biases):
-        runs = [r for r in R if r["social"].get("refuse_bias") == bias]
-        x = per_day([], runs[0]["day"], days)[0]
-        rates = []
-        for r in runs:
-            y = per_day([st for st, a, *_ in r["acts"] if a == "attack"], r["day"], days)[1]
-            ax.plot(x, y, color=SLOT[i], lw=0.6, alpha=0.5)
-            rates.append(y)
-        m = np.mean(rates, axis=0)
-        ax.plot(x, m, color=SLOT[i], lw=LW, label=f"refusal bias γ_R0 = {bias:g}")
-        end_label(ax, x[-1], m[-1], f"γ_R0 = {bias:g}")
-    ax.set_title(f"Feud spiral: attacks per day in condition 1 for three refusal biases ({len(runs)} seeds each, thin = single seed)")
-    ax.set_xlabel("day")
-    ax.set_ylabel("attacks per day")
-    headroom(ax, 1.2)
-    ax.legend(loc="upper left", ncols=3)
-    fig.savefig(out / "7_feud_spiral.png", dpi=130)
+def fig_learned_weights(R: list[dict], out: Path) -> None:
+    """What agents learned (spec §5.3d): mean advantage weight per feature, Q(act) − Q(no act), last day."""
+    from emergent_politeness.learning import FEATURES
+    acts = ("give", "refuse", "attack")
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6), constrained_layout=True)
+    width = 0.38
+    for ax, act in zip(axes, acts):
+        names = FEATURES[act]
+        for i, cond in enumerate(("1", "4")):
+            ws = np.array([a["advantage"][act] for r in R if r["cond"] == cond and r["snapshot"]
+                           for a in r["snapshot"]["agents"].values() if a.get("advantage")])
+            m = ws.mean(axis=0)
+            se = ws.std(axis=0) / np.sqrt(len(ws))
+            y = np.arange(len(names)) + (i - 0.5) * width
+            ax.barh(y, m, height=width - 0.05, color=COND_COLOR[cond], label=COND_LABEL[cond],
+                    xerr=se, error_kw={"ecolor": INK2, "elinewidth": 0.8, "capsize": 0})
+        ax.axvline(0, color=AXIS, lw=0.9)
+        ax.set_yticks(range(len(names)), [n.replace("cfg_", "status: ").replace("_", " ") for n in names])
+        ax.invert_yaxis()
+        ax.grid(axis="y", visible=False)
+        ax.set_title(f"{act}: learned advantage of acting (food units)", fontsize=9.5)
+        ax.set_xlabel("weight  (< 0: the act tends to cost me, > 0: it tends to pay)")
+    axes[0].legend(loc="lower left")
+    fig.savefig(out / "7_learned_weights.png", dpi=130)
+    plt.close(fig)
+
+
+def fig_learning_over_time(R: list[dict], out: Path) -> None:
+    """How a few learned weights develop: daily mean over living agents, mean over seeds."""
+    from emergent_politeness.learning import FEATURES
+    panels = [("refuse", "crowding"), ("refuse", "other_hunger"), ("refuse", "liking"),
+              ("give", "other_hunger"), ("give", "liking"), ("attack", "anger")]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 6.5), constrained_layout=True, sharex=True)
+    for ax, (act, feat) in zip(axes.flat, panels):
+        n = FEATURES[act].index(feat)
+        for cond in ("1", "4"):
+            series = [np.array([np.nan if w is None else w[act][n] for w in r["weights_daily"]])
+                      for r in R if r["cond"] == cond and r["weights_daily"]]
+            if not series:
+                continue
+            m = np.nanmean(np.vstack(series), axis=0)
+            ax.plot(np.arange(len(m)), m, color=COND_COLOR[cond], lw=LW, label=COND_LABEL[cond])
+        ax.axhline(0, color=AXIS, lw=0.9)
+        ax.set_title(f"{act}: weight on {feat.replace('_', ' ')}", fontsize=9.5)
+    for ax in axes[1]:
+        ax.set_xlabel("day")
+    axes[0, 0].legend(loc="lower left")
+    fig.savefig(out / "8_learning_over_time.png", dpi=130)
     plt.close(fig)
 
 
@@ -270,34 +308,33 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--days", type=float, default=60)
-    ap.add_argument("--spiral-seeds", type=int, default=4)
     ap.add_argument("--out", default="figures/stage2")
     ap.add_argument("--reuse", action="store_true", help="reuse cached simulation results from runs/")
+    ap.add_argument("--social", action="append", default=[], metavar="param=value",
+                    help="override a SocialParams value for all runs, e.g. gift_status=true")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    cache = Path("runs") / f"stage2_plot_{args.seeds}seeds_{args.days:g}days.pkl"
+    base = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.social)}
+    tag = "".join(f"_{k}-{v}" for k, v in sorted(base.items()))
+    cache = Path("runs") / f"stage2_plot_{args.seeds}seeds_{args.days:g}days{tag}.pkl"
     if args.reuse and cache.exists():
         R = pickle.loads(cache.read_bytes())
     else:
-        jobs = [(c, s, args.days, {}) for c in ("0", "1", "4") for s in range(args.seeds)]
-        jobs += [("1", s, args.days, {"refuse_bias": b}) for b in (-4.0, -4.5) for s in range(args.spiral_seeds)]
+        jobs = [(c, s, args.days, dict(base)) for c in ("0", "1", "4") for s in range(args.seeds)]
         with ProcessPoolExecutor() as pool:
             R = list(pool.map(run_one, jobs))
         cache.parent.mkdir(exist_ok=True)
         cache.write_bytes(pickle.dumps(R))
-    default_bias = Config().social.refuse_bias
-    spiral = [r for r in R if r["social"]] + [
-        {**r, "social": {"refuse_bias": default_bias}} for r in R if r["cond"] == "1" and not r["social"] and r["seed"] < args.spiral_seeds
-    ]
     fig_population_deaths(R, out, args.days)
     fig_act_rates(R, out, args.days)
     fig_daily_cycle(R, out)
     fig_refusal_inputs(R, out)
     fig_status_strength(R, out)
     fig_liking(R, out)
-    fig_feud_spiral(spiral, out, args.days)
     fig_expectations(R, out)
+    fig_learned_weights(R, out)
+    fig_learning_over_time(R, out)
     print("wrote", sorted(p.name for p in out.glob("*.png")))
 
 

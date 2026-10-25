@@ -76,7 +76,7 @@ class TaskParams:
     danger_weight: float = 2.0  # λ_d
     fatigue_weight: float = 1.0  # λ_X
     cold_weight: float = 60.0  # λ_c: cold raises thresholds for outside tasks; chosen by the user
-    approval_weight: float = 0.3  # λ_A (affect conditions only)
+    approval_weight: float = 0.0  # λ_A; 0 = removed as a built-in disposition (audit item 14)
     patch_danger_aversion: float = 5.0  # λ_d'
     patch_choice_temp: float = 0.2
     food_per_capita: float = 3.0  # f_pc
@@ -109,7 +109,7 @@ class SocialParams:
     alpha_E_act: float = 0.15  # α_Eφ
     alpha_P_act: float = 0.15  # α_Pφ
     bystander_weight: float = 0.5  # β_by
-    balance_mix: float = 0.5  # λ_b: 0 = image scoring, 1 = balance theory
+    balance_mix: float = 0.0  # λ_b: 0 = image scoring (default, user 2026-10-25), 1 = balance theory (variant)
     balance_gain: float = 3.0  # γ_b
     transient_decay: float = 0.3  # ρ_τ
     self_status_rate: float = 0.03  # ε_S
@@ -117,6 +117,12 @@ class SocialParams:
     self_status_decay: float = 0.001  # ε_dec
     contribution_E: float = 0.002  # α_C; near zero by user decision (sightings inflated liking)
     contribution_P: float = 0.002  # α_C'
+    # Status as a positional good (spec §5.3b): each agent's status ratings, its own included, average zero
+    relative_status: bool = True
+    # Prestige from gifts (spec §5.3c, option B): a gift asserts some standing for the giver (Mauss 1925),
+    # appraised by its learned surprise per status configuration. Toggle to compare with and without.
+    gift_status: bool = False
+    gift_status_value: float = 0.2  # p of GIVE when gift_status is on (off: v_give's p, i.e. 0)
     # Learned status expectations (spec §5.3a): per status configuration actor above / level / below target
     status_bin_width: float = 0.2  # θ_b
     expectation_rate: float = 0.05  # η_x, delta-rule rate
@@ -133,24 +139,27 @@ class SocialParams:
     ledger_refuse_entry: float = -0.5
     ledger_attack: float = -1.0
     ledger_contribution: float = 0.02  # weight on u_τ when a deposit is seen; scaled down with α_C
-    # Decision weights (logistic), spec §5.3
-    give_bias: float = -2.0  # γ_G0
-    give_liking: float = 2.0  # γ_GE
-    give_need: float = 2.0  # γ_need
-    give_own_hunger: float = 3.0  # γ_own
-    hungry_visible: float = 0.7  # target counts as visibly hungry above this
-    refuse_bias: float = -5.0  # γ_R0; calibrated with learned status + level cap (spec guess −2 caused a feud spiral)
-    refuse_liking: float = 2.0  # γ_RE
-    refuse_crowding: float = 3.0  # γ_C
-    refuse_risk: float = 4.0  # γ_Rrisk: weight on the learned risk of a lost retaliation fight
+    # Decisions (spec §5.3d): no fixed-sign social dispositions. Whether an act toward someone pays is
+    # learned from consequences: a linear prediction of the material return of acting vs not acting.
+    exploration_bias: float = -3.0  # common baseline propensity for every act at every opportunity (≈5%);
+    # how often each act happens beyond this is learned (user decision 2026-10-25: no act-specific levels)
+    give_own_hunger: float = 3.0  # grounding: food given away is worth more to a hungry giver
+    hungry_visible: float = 0.7  # a neighbour above this hunger is a gift *opportunity* (no weight on need)
     refusal_cooldown: int = 10  # steps a refused agent waits before asking again
-    attack_bias: float = -4.5  # γ_A0; calibrated
-    attack_liking: float = 2.0  # γ_AE
-    attack_expected_win: float = 2.0  # γ_AW: weight on (2·p̂_win − 1), the learned chance of winning
-    attack_hunger: float = 2.0  # γ_AH
-    attack_transient: float = 2.0  # γ_Aτ
-    attack_transient_trigger: float = 0.3  # a transient e below −this toward a neighbour triggers ATTACK
-
+    attack_transient_trigger: float = 0.3  # anger (transient e below −this) toward a neighbour is an opportunity
+    choice_gain: float = 2.0  # β: weight on the learned return difference Q(act) − Q(no act)
+    return_rate: float = 0.05  # η_q, normalised delta rule
+    return_window: int = 300  # steps over which an act's material return is counted
+    # Social learning (spec §5.3e, toggle): payoff-biased copying of learned weights ("imitate if better",
+    # proportional imitation; Schlag 1998). Success = visible body condition only: health · (1 − hunger).
+    social_learning: bool = False
+    copy_rate: float = 1 / 300  # chance per step that an agent looks at a random agent in view
+    copy_strength: float = 0.2  # μ: how far weights move toward the model's when copying
+    # Material return ("welfare") events, in food units, from anyone (direct + indirect reciprocity)
+    welfare_store_food: float = 1.0  # eating or taking a ration from the shared store
+    welfare_gift: float = 1.0  # receiving (+) or giving away (−) a unit of food
+    welfare_refused: float = -0.5  # being refused entry
+    welfare_damage: float = -1.0  # per fight-damage unit q_f taken
 
 @dataclass(frozen=True)
 class PopulationParams:

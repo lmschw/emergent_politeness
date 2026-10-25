@@ -42,10 +42,18 @@ class Shelter:
         self.door_out = self.centre + d * (self.radius + 1.0)  # waypoint just outside the door
         self.door_in = self.centre + d * (self.radius - 1.0)  # waypoint just inside the door
 
-    def queue_spot(self, agent_id: int) -> np.ndarray:
-        """Where an agent waits when the door is closed: in front of the door, spread sideways."""
-        perp = np.array([-self.door_dir[1], self.door_dir[0]])
-        return self.centre + self.door_dir * (self.radius + 2.2) + perp * ((agent_id % 5) - 2) * 0.7
+    def door_side(self, pos) -> int:
+        """Which side of the door axis a point is on (+1 or −1)."""
+        rx, ry = pos[0] - self.centre[0], pos[1] - self.centre[1]
+        return 1 if self.door_dir[0] * ry - self.door_dir[1] * rx >= 0 else -1
+
+    def queue_spot(self, position: int, side: int = 1) -> np.ndarray:
+        """Place number `position` (0 = front) in the entry line on one side of the door. The lines
+        run along the wall and start beside the door, so the doorway itself stays clear."""
+        r = self.radius + 1.3  # far enough from the wall that a pressing line cannot squeeze agents through it
+        arc = 1.8 + 0.75 * position  # metres along the wall from the door axis
+        a = math.atan2(self.door_dir[1], self.door_dir[0]) + side * arc / r
+        return self.centre + r * np.array([math.cos(a), math.sin(a)])
 
     @property
     def capacity(self) -> int:
@@ -66,7 +74,7 @@ class Shelter:
     def update(self) -> None:
         self.food *= 1.0 - self.p.food_spoilage
         # Larger shelters wear faster, so size settles where maintenance labour can sustain it.
-        size = self.capacity / self.p.capacity_base if self.p.capacity_base > 0 else 1.0
+        size = self.capacity / self.p.capacity_base if (self.p.capacity_base > 0 and self.p.decay_scales_with_size) else 1.0
         self.integrity = max(0.0, self.integrity - self.p.integrity_decay * size)
 
     def required_progress(self) -> float:

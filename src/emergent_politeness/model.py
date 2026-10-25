@@ -1,4 +1,8 @@
-"""Simulation loop (spec §3). Stage 1: survival world only (condition 0)."""
+"""Simulation loop (spec §3).
+
+Stage 1: survival world (condition 0). Stage 2: agent-to-agent physical acts
+(GIVE, REFUSE_ENTRY, ATTACK) with ledger opinions (condition 1) or affective
+opinions (condition 4)."""
 
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ from .config import Config
 from .environment import FOOD, MATERIAL, Environment, Patch
 from .events import EventLog
 from .physics import PhysicsWorld
+from .social import Opinions, sigmoid
+
 
 def clip(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
@@ -22,15 +28,16 @@ def dist(p, q) -> float:
 
 
 GRANT_TIMEOUT = 30  # decision steps before an unused door grant expires
+QUEUE_JOIN_RADIUS = 6.0  # an agent wanting in joins the entry queue within this distance of the door
 TASK_RESOURCE = {Task.COLLECT_FOOD: FOOD, Task.COLLECT_MATERIAL: MATERIAL}
 
 
 class Simulation:
     def __init__(self, config: Config) -> None:
         c = config.condition
-        if c.physical_acts or c.language or c.affect:
+        if c.language:
             raise NotImplementedError(
-                f"Condition {c.name!r} needs stage 2+; only condition 0 (survival world) is implemented."
+                f"Condition {c.name!r} needs language (stage 3+); conditions 0, 1 and 4 are implemented."
             )
         self.cfg = config
         self.rng = np.random.default_rng(config.sim.seed)
@@ -44,6 +51,10 @@ class Simulation:
         # Door grants: agent id -> step granted. Entering grants count against capacity.
         self.entering: dict[int, int] = {}
         self.exiting: dict[int, int] = {}
+        # Turn-taking at the door: first come, first served (avoids hidden id-order bias).
+        self.entry_queue: list[int] = []
+        self.exit_queue: list[int] = []
+        self.queue_side: dict[int, int] = {}  # side of the door an agent queues on, fixed when it joins
         self.physics = PhysicsWorld(
             arena_size=config.world.arena_size,
             shelter=self.env.shelter,
@@ -53,6 +64,14 @@ class Simulation:
         )
         self.series: dict[str, list] = defaultdict(list)
         self.task_steps: Counter[tuple[int, Task]] = Counter()  # for division of labour
+        # Stage 2: social acts and opinions. Nothing here touches the RNG in condition 0.
+        self.acts_on = c.physical_acts
+        self.opinions = Opinions(config.social, c.affect, self.rng) if (c.physical_acts or c.language) else None
+        self.snapshots: list[dict] = []  # daily opinion snapshots for analysis
+        # Refusals awaiting a possible retaliation: (arriver, guard) -> (deadline step, [(observer, bin)])
+        self._pending_retaliation: dict[tuple[int, int], tuple[int, list]] = {}
+        self._exits_active = self._entries_active = False
+        self._stimuli_now: dict[Task, float] = {}
         self._spawn_initial()
 
     # ------------------------------------------------------------------
@@ -74,6 +93,8 @@ class Simulation:
             hunger=hunger,
         )
         self._next_id += 1
+        if self.opinions is not None:
+            a.expect = self.opinions.new_expectations()
         self.agents[a.id] = a
         self.physics.add_agent(a.id, pos)
         a.inside = self.env.shelter.contains(pos)
@@ -112,9 +133,15 @@ class Simulation:
                 self.n_inside -= 1
             self.entering.pop(a.id, None)
             self.exiting.pop(a.id, None)
+            for q in (self.entry_queue, self.exit_queue):
+                if a.id in q:
+                    q.remove(a.id)
             self.physics.remove_agent(a.id)
             del self.agents[a.id]
             self.dead.append(a)
+            if self.opinions is not None:  # idealised: everyone learns of a death
+                for other in self.agents.values():
+                    other.memory.pop(a.id, None)
 
     # ------------------------------------------------------------------
     # Movement and the door
@@ -148,38 +175,80 @@ class Simulation:
         sh = self.env.shelter
         goal = self._goal(a)
         goal_inside = sh.contains(goal)
+        flow = self.cfg.world.door_flow
         if a.inside:
             if goal_inside:
                 return goal
-            if sh.in_doorway(pos) or dist(pos, sh.door_in) < 0.7:
-                self.exiting.setdefault(a.id, self.k)
-                return sh.door_out
-            return sh.door_in
+            if a.id in self.exiting:
+                return sh.door_out if sh.in_doorway(pos) or dist(pos, sh.door_in) < 0.7 else sh.door_in
+            # Ask to leave: wait for your turn where you are.
+            if a.id not in self.exit_queue:
+                self.exit_queue.append(a.id)
+            if self.exit_queue[0] == a.id and len(self.exiting) < flow and not self._entries_active:
+                self.exit_queue.pop(0)
+                self.exiting[a.id] = self.k
+                return sh.door_in
+            return pos
         if not goal_inside:
             return self._detour(pos, goal)
         self.exiting.pop(a.id, None)  # permission to leave never lets an agent back in
-        at_door = self._at_door(a, pos)
         if a.id in self.entering:
-            return sh.door_in if sh.in_doorway(pos) or dist(pos, sh.door_out) < 0.6 else sh.door_out
-        if not at_door:
-            return self._detour(pos, sh.queue_spot(a.id))
-        # At the door: ask to be let in (capacity check; REFUSE_ENTRY plugs in here in stage 2).
-        if self.n_inside + len(self.entering) < sh.capacity:
-            self.entering[a.id] = self.k
-            a.waiting_at_door = False
-            return sh.door_out
-        if not a.waiting_at_door:
-            a.waiting_at_door = True
-            self.log.log(self.k, "door_blocked", agent=a.id, reason="capacity")
-        return sh.queue_spot(a.id)
+            if sh.in_doorway(pos) or dist(pos, sh.door_out) < 0.6:
+                return sh.door_in
+            if self._exits_active:  # one direction at a time; leaving agents go first
+                return pos
+            return self._detour(pos, sh.door_out)
+        if a.id not in self.entry_queue:
+            if dist(pos, sh.door_out) > QUEUE_JOIN_RADIUS:
+                return self._detour(pos, sh.door_out)
+            self.entry_queue.append(a.id)  # join at the back, on the side the agent arrived from
+            self.queue_side[a.id] = sh.door_side(pos)
+        side = self.queue_side[a.id]
+        ahead = sum(1 for i in self.entry_queue[: self.entry_queue.index(a.id)] if self.queue_side.get(i) == side)
+        queue = self._detour(pos, sh.queue_spot(ahead, side))
+        if self.acts_on and self.k < a.refused_until:
+            return queue
+        if self.n_inside + len(self.entering) >= sh.capacity:
+            if not a.waiting_at_door:
+                a.waiting_at_door = True
+                self.log.log(self.k, "door_blocked", agent=a.id, reason="capacity")
+            return queue
+        head = next((i for i in self.entry_queue
+                     if not (self.acts_on and self.k < self.agents[i].refused_until)), None)
+        in_transit = sum(1 for i in self.entering if not self.agents[i].inside)
+        if head != a.id or in_transit >= flow:
+            return queue
+        if self.acts_on and self._refused_by_guard(a):
+            self.entry_queue.remove(a.id)  # a refused agent goes to the back of the queue
+            return queue
+        self.entry_queue.remove(a.id)
+        self.entering[a.id] = self.k
+        a.waiting_at_door = False
+        return sh.door_out
 
     def _at_door(self, a: Agent, pos) -> bool:
         sh = self.env.shelter
-        return sh.in_doorway(pos) or dist(pos, sh.door_out) < 1.0 or dist(pos, sh.queue_spot(a.id)) < 1.0
+        return a.id in self.entry_queue or sh.in_doorway(pos) or dist(pos, sh.door_out) < 1.0
+
+    def _door_traffic(self) -> None:
+        """Who is using the door right now (spec §10, door rules): agents leaving that are in or
+        next to the doorway, and agents entering that are in the doorway."""
+        sh = self.env.shelter
+        self._exits_active = self._entries_active = False
+        for aid in self.exiting:
+            p = self.physics.position(aid)
+            if sh.in_doorway(p, tol=1.2) or dist(p, sh.door_in) < 1.2:
+                self._exits_active = True
+                break
+        for aid in self.entering:
+            if sh.in_doorway(self.physics.position(aid), tol=1.2):
+                self._entries_active = True
+                break
 
     def _move(self) -> None:
         sp = self.cfg.sim
         for _ in range(sp.physics_ticks):
+            self._door_traffic()
             for a in self.agents.values():
                 pos = self.physics.position(a.id)
                 w = self._waypoint(a, pos)
@@ -199,7 +268,7 @@ class Simulation:
             now_inside = sh.contains(pos)
             if now_inside and not a.inside and not self._entry_allowed(a):
                 # Safety net: physics glitches (crowd pressure) must not break the capacity rule.
-                self.physics.set_position(a.id, sh.queue_spot(a.id))
+                self.physics.set_position(a.id, sh.queue_spot(len(self.entry_queue), sh.door_side(pos)))
                 self.log.log(self.k, "ejected", agent=a.id)
                 continue
             if now_inside != a.inside:
@@ -214,6 +283,14 @@ class Simulation:
                 (not a.inside and not sh.in_doorway(pos, tol=1.2)) or self.k - self.exiting[a.id] > GRANT_TIMEOUT
             ):
                 del self.exiting[a.id]
+
+    def _clean_door_queues(self) -> None:
+        sh, ag = self.env.shelter, self.agents
+        self.entry_queue = [i for i in self.entry_queue if i in ag and not ag[i].inside and i not in self.entering
+                            and sh.contains(self._goal(ag[i]))]
+        self.queue_side = {i: s for i, s in self.queue_side.items() if i in self.entry_queue}
+        self.exit_queue = [i for i in self.exit_queue if i in ag and ag[i].inside and i not in self.exiting
+                           and not sh.contains(self._goal(ag[i]))]
 
     def _entry_allowed(self, a: Agent) -> bool:
         if a.id in self.entering:
@@ -277,7 +354,7 @@ class Simulation:
         """Task stimuli s_τ (spec §5.2); global, so computed once per step."""
         sh, tp, wp = self.env.shelter, self.cfg.tasks, self.cfg.world
         n = max(1, len(self.agents))
-        build = clip((n - sh.capacity) / max(1, sh.capacity), 0.0, 1.0)
+        build = clip((n - sh.capacity) / max(1, sh.capacity), 0.0, 1.0) if sh.level < wp.max_level else 0.0
         material_need = max(1 - sh.integrity, build)  # material is only worth collecting if it will be used
         return {
             Task.COLLECT_FOOD: clip(1 - sh.food / (tp.food_per_capita * n), 0.0, 1.0),
@@ -339,6 +416,8 @@ class Simulation:
                     else:
                         sh.material += a.load
                     self.log.log(self.k, "deposit", agent=a.id, resource=a.load_kind, amount=a.load)
+                    if self.opinions is not None:
+                        self._contribution_seen(a)
                 a.load, a.load_kind = 0.0, None
                 self._end(a, "done")
         elif a.task in (Task.MAINTAIN, Task.BUILD):
@@ -352,8 +431,8 @@ class Simulation:
                 sh.material -= wp.material_per_maintain_step
                 sh.integrity = min(1.0, sh.integrity + wp.maintain_rate)
             else:
-                if sh.material < wp.material_per_build_step:
-                    return self._end(a, "no_material")
+                if sh.material < wp.material_per_build_step or sh.level >= wp.max_level:
+                    return self._end(a, "no_material" if sh.level < wp.max_level else "max_level")
                 sh.material -= wp.material_per_build_step
                 sh.build_progress += 1
                 if sh.build_progress >= sh.required_progress():
@@ -392,6 +471,8 @@ class Simulation:
             theta = a.thresholds[task] * (1 + tp.danger_weight * danger) * (1 + tp.fatigue_weight * a.fatigue)
             if task in OUTSIDE_TASKS:
                 theta *= 1 + tp.cold_weight * cold
+            if self.opinions is not None and self.opinions.affect:  # approval seeking (Roberts 1998)
+                theta *= 1 - tp.approval_weight * max(0.0, -a.acceptance)
             if self.rng.random() < self.response_probability(s, theta):
                 return self._start(a, task, patch)
 
@@ -405,6 +486,210 @@ class Simulation:
                     self.task_steps[(a.id, task)] += 1
                 else:
                     a.thresholds[task] = min(tp.theta_max, a.thresholds[task] + tp.theta_forget)
+
+    # ------------------------------------------------------------------
+    # Agent-to-agent physical acts (spec §5.3)
+    # ------------------------------------------------------------------
+    def _observers(self, *parties: Agent) -> list[Agent]:
+        """Agents within r_see of any party (parties included)."""
+        r = self.cfg.social.r_see
+        pts = [self.physics.position(x.id) for x in parties]
+        out = []
+        for o in self.agents.values():
+            po = self.physics.position(o.id)
+            if any(dist(po, p) < r for p in pts):
+                out.append(o)
+        return out
+
+    def _act(self, actor: Agent, target: Agent, kind: str, value, ledger: float, appraise: str | None = None,
+             observers: list[Agent] | None = None, **extra) -> list[Agent]:
+        """Log an act and let everyone nearby update their opinions. `appraise` names the
+        expectation table whose surprise scales the affective impact (spec §5.3a)."""
+        self.log.log(self.k, "act", act=kind, actor=actor.id, target=target.id, **extra)
+        if observers is None:
+            observers = self._observers(actor, target)
+        if target not in observers:
+            observers.append(target)
+        for o in observers:
+            self.opinions.observe_act(o, actor, target, value, ledger, self.k, act=appraise)
+        return observers
+
+    def _resolve_retaliation(self, avenged: tuple[int, int] | None = None) -> None:
+        """Observers of a refusal learn whether it was avenged (attack within one step)."""
+        op = self.opinions
+        if avenged is not None and avenged in self._pending_retaliation:
+            _, seen = self._pending_retaliation.pop(avenged)
+            for o, b in seen:
+                if o.alive:
+                    op.observe_retaliation(o, b, True)
+        for key in [key for key, (deadline, _) in self._pending_retaliation.items() if deadline < self.k]:
+            _, seen = self._pending_retaliation.pop(key)
+            for o, b in seen:
+                if o.alive:
+                    op.observe_retaliation(o, b, False)
+
+    def _refused_by_guard(self, a: Agent) -> bool:
+        """Idle insiders near the door may refuse an arriving agent (REFUSE_ENTRY)."""
+        sh, sp, op = self.env.shelter, self.cfg.social, self.opinions
+        guards = [
+            g for g in self.agents.values()
+            if g.inside and g.task == Task.IDLE and dist(self.physics.position(g.id), sh.door_in) < sp.r_door
+        ]
+        crowding = self.n_inside / max(1, sh.capacity)
+        for i in self.rng.permutation(len(guards)):
+            g = guards[i]
+            liking, risk = op.liking(g, a.id), op.refusal_risk(g, a.id)
+            x = sp.refuse_bias - sp.refuse_liking * liking + sp.refuse_crowding * crowding - sp.refuse_risk * risk
+            refused = self.rng.random() < sigmoid(x)
+            self.log.log(self.k, "entry_check", guard=g.id, agent=a.id, liking=round(liking, 4),
+                         status_gap=round(g.self_status - op.status(g, a.id), 4), risk=round(risk, 4),
+                         crowding=round(crowding, 4), refused=refused)
+            observers = self._observers(g, a)
+            # Status configurations as each observer saw them *before* the decision (spec §5.3a).
+            bins_refuse = [op.bin(o, g.id, a.id) for o in observers]
+            bins_avenge = [op.bin(o, a.id, g.id) for o in observers]
+            if refused:
+                a.refused_until = self.k + sp.refusal_cooldown
+                a.refused_by, a.refused_at = g.id, self.k
+                if not a.waiting_at_door:
+                    a.waiting_at_door = True
+                    self.log.log(self.k, "door_blocked", agent=a.id, reason="refused")
+                self._act(g, a, "refuse_entry", sp.v_refuse_entry, sp.ledger_refuse_entry, appraise="refuse",
+                          observers=observers)
+                # Will the refused agent retaliate? Observers learn from the answer (see _resolve_retaliation).
+                self._pending_retaliation[(a.id, g.id)] = (
+                    self.k + 1, [(o, b) for o, b in zip(observers, bins_avenge) if o is not g])
+            for o, b in zip(observers, bins_refuse):
+                op.observe_entry_decision(o, g, a, refused, b)
+            if refused:
+                return True
+        return False
+
+    def _social_acts(self) -> None:
+        """Each agent may ATTACK or GIVE once per step (attack triggers first)."""
+        ids = list(self.agents)
+        if len(ids) < 2:
+            return
+        sp = self.cfg.social
+        pos = np.array([tuple(self.physics.position(i)) for i in ids])
+        d = np.hypot(pos[:, None, 0] - pos[None, :, 0], pos[:, None, 1] - pos[None, :, 1])
+        harvesters: dict[int, list[Agent]] = defaultdict(list)
+        for a in self.agents.values():
+            if a.task in OUTSIDE_TASKS and a.phase == Phase.HARVEST:
+                harvesters[a.patch].append(a)
+        acted: set[int] = set()
+        for n in self.rng.permutation(len(ids)):
+            a = self.agents[ids[n]]
+            if a.id in acted or a.health <= 0:
+                continue
+            near = [self.agents[ids[m]] for m in np.flatnonzero(d[n] < sp.r_act)
+                    if m != n and ids[m] not in acted and self.agents[ids[m]].health > 0]
+            choice = self._attack_choice(a, near, harvesters, acted)
+            if choice is not None:
+                target, reason = choice
+                acted.update((a.id, target.id))
+                self._fight(a, target, reason)
+                continue
+            target = self._give_choice(a, near)
+            if target is not None:
+                acted.add(a.id)
+                self._give(a, target)
+
+    def _attack_choice(self, a: Agent, near: list[Agent], harvesters, acted) -> tuple[Agent, str] | None:
+        sp, op = self.cfg.social, self.opinions
+        candidates: list[tuple[Agent, str]] = []
+        if a.refused_by is not None and self.k - a.refused_at <= 1 and not a.inside:
+            g = self.agents.get(a.refused_by)
+            if g is not None and g.id not in acted and g.inside and self._at_door(a, self.physics.position(a.id)):
+                candidates.append((g, "refused"))  # reach across the doorway (idealised)
+        if a.task in OUTSIDE_TASKS and a.phase == Phase.HARVEST:
+            here = harvesters[a.patch]
+            rivals = [r for r in here if r is not a and r.id not in acted and r.health > 0]
+            if rivals and self.env.patches[a.patch].stock < self.cfg.body.harvest_rate * len(here):
+                candidates.append((max(rivals, key=lambda r: op.expected_win(a, a.id, r.id)), "patch"))
+        if op.affect:
+            for t in near:
+                if op.transient_e(a, t.id) < -sp.attack_transient_trigger:
+                    candidates.append((t, "grudge"))
+                    break
+        for t, reason in candidates:
+            x = (sp.attack_bias - sp.attack_liking * op.liking(a, t.id)
+                 + sp.attack_expected_win * (2 * op.expected_win(a, a.id, t.id) - 1)
+                 + sp.attack_hunger * a.hunger + sp.attack_transient * max(0.0, -op.transient_e(a, t.id)))
+            if self.rng.random() < sigmoid(x):
+                return t, reason
+        return None
+
+    def _fight(self, a: Agent, t: Agent, reason: str) -> None:
+        sp = self.cfg.social
+
+        def strength(x: Agent) -> float:
+            return x.health * (1 - 0.5 * x.fatigue) * x.strength
+
+        a_wins = self.rng.random() < sigmoid(sp.fight_sharpness * (strength(a) - strength(t)))
+        winner, loser = (a, t) if a_wins else (t, a)
+        loser.health -= sp.fight_damage
+        winner.health -= sp.winner_damage_frac * sp.fight_damage
+        loser.last_damage = winner.last_damage = "fight"
+        value = sp.v_attack_win if a_wins else sp.v_attack_lose
+        observers = self._observers(a, t)
+        op = self.opinions  # status configurations as seen before the fight (spec §5.3a)
+        bins = {o.id: (op.bin(o, winner.id, loser.id), op.bin(o, loser.id, winner.id)) for o in observers}
+        observers = self._act(a, t, "attack", value, sp.ledger_attack, appraise="attack", observers=observers,
+                              reason=reason, actor_won=a_wins)
+        if reason == "refused":
+            self._resolve_retaliation(avenged=(a.id, t.id))
+        for o in observers:
+            self.opinions.observe_fight(o, winner, loser, self.k, bins.get(o.id))
+        if loser.task in OUTSIDE_TASKS and loser.phase == Phase.HARVEST:
+            loser.phase = Phase.RETURN  # the loser retreats from the patch
+        if reason == "refused":  # winning the fight settles whether the door opens
+            a.refused_until = self.k if a_wins else self.k + sp.refusal_cooldown
+
+    def _give_choice(self, a: Agent, near: list[Agent]) -> Agent | None:
+        sp = self.cfg.social
+        food = a.rations + (int(a.load) if a.load_kind == FOOD else 0)
+        hungry = [t for t in near if t.hunger > sp.hungry_visible]
+        if food < 1 or not hungry:
+            return None
+        t = max(hungry, key=lambda x: x.hunger)
+        x = (sp.give_bias + sp.give_liking * self.opinions.liking(a, t.id)
+             + sp.give_need * t.hunger - sp.give_own_hunger * a.hunger)
+        return t if self.rng.random() < sigmoid(x) else None
+
+    def _give(self, a: Agent, t: Agent) -> None:
+        sp = self.cfg.social
+        if a.load_kind == FOOD and a.load >= 1:
+            a.load -= 1
+            source = "load"
+        else:
+            a.rations -= 1
+            source = "ration"
+        t.rations += 1
+        self._act(a, t, "give", sp.v_give, sp.ledger_give, source=source)
+
+    def _contribution_seen(self, a: Agent) -> None:
+        """Delivering to the store is visible work (spec §5.2): u = s_τ·(1 + d_τ)."""
+        danger = self.env.patches[a.patch].danger if a.patch is not None else 0.0
+        u = self._stimuli_now.get(a.task, 0.0) * (1 + danger)
+        for o in self._observers(a):
+            self.opinions.observe_contribution(o, a, u, danger, self.k)
+
+    def _snapshot(self) -> None:
+        op = self.opinions
+        self.snapshots.append({
+            "step": self.k,
+            "agents": {
+                a.id: {
+                    "self_status": a.self_status,
+                    "acceptance": a.acceptance,
+                    "strength": a.strength,
+                    "expect": {name: list(v) for name, v in a.expect.items()},
+                    "memory": {j: (op.liking(a, j), imp.P, imp.F) for j, imp in a.memory.items()},
+                }
+                for a in self.agents.values()
+            },
+        })
 
     # ------------------------------------------------------------------
     # Main loop
@@ -433,6 +718,7 @@ class Simulation:
     def step(self) -> None:
         self._move()
         self._update_locations()
+        self._clean_door_queues()
         self.env.update()
         cold = self.env.cold(self.k)
         for a in self.agents.values():
@@ -443,12 +729,21 @@ class Simulation:
         # Talk phase: stage 3+.
         for a in self.agents.values():
             self._overrides(a)
-        stimuli = self._stimuli()
+        if self.acts_on:
+            self._social_acts()
+            self._resolve_retaliation()
+            self._remove_dead()
+        stimuli = self._stimuli_now = self._stimuli()
         for aid in self.rng.permutation(list(self.agents)):
             a = self.agents[int(aid)]
             if a.task == Task.IDLE:
                 self._decide(a, stimuli, cold)
         self._reinforce_thresholds()
+        if self.opinions is not None:
+            for a in self.agents.values():
+                self.opinions.decay(a)
+            if self.k % self.cfg.world.day_length == 0:
+                self._snapshot()
         self._record(cold)
         self.k += 1
 

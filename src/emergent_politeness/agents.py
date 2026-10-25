@@ -1,9 +1,9 @@
-"""Agent state (spec §2.2). Stage 1 holds body and task state only; the
-social and language state is added in later stages."""
+"""Agent state (spec §2.2): body, task and (from stage 2) social state.
+Language state is added in stage 3."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
@@ -54,6 +54,14 @@ class Agent:
     last_damage: str | None = None
     alive: bool = True
     waiting_at_door: bool = False
+    # Social state (stage 2+)
+    self_status: float = 0.0  # Ŝ
+    acceptance: float = 0.0  # Â
+    memory: dict = field(default_factory=dict)  # other id -> social.Impression
+    expect: dict = field(default_factory=dict)  # learned status expectations, see social.Opinions
+    refused_until: int = -1  # cannot ask to enter again before this step
+    refused_by: int | None = None
+    refused_at: int = -10**9
 
     @property
     def working(self) -> bool:

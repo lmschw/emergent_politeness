@@ -1,9 +1,10 @@
-"""Run the survival world (condition 0) over several seeds and print calibration measures.
+"""Run one condition over several seeds and print calibration measures.
 
 Examples:
-    uv run python scripts/run_stage1.py --seeds 8 --days 20
-    uv run python scripts/run_stage1.py --set world.food_regrowth=0.03 --set tasks.food_per_capita=4
-    uv run python scripts/run_stage1.py --sweep world.food_regrowth=0.02,0.03,0.05
+    uv run python scripts/run.py --seeds 8 --days 20                 # condition 0
+    uv run python scripts/run.py --condition 1 --days 50 --burn-in 30
+    uv run python scripts/run.py --set world.food_regrowth=0.03 --set tasks.food_per_capita=4
+    uv run python scripts/run.py --condition 4 --sweep social.refuse_bias=-3,-4,-5
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from emergent_politeness.config import Config
-from emergent_politeness.metrics import summary
+from emergent_politeness.config import CONDITIONS, Config
+from emergent_politeness.metrics import social_summary, summary
 from emergent_politeness.model import Simulation
 
 SHOW = [
@@ -23,6 +24,12 @@ SHOW = [
     "deaths_injury", "frac_steps_shelter_full", "frac_outside_at_night", "door_blocked_per_day",
     "food_per_capita", "level_final", "integrity_mean", "work_share_collect_food", "work_share_collect_material",
     "work_share_maintain", "work_share_build", "division_of_labour",
+]
+SHOW_SOCIAL = [
+    "gives_per_day", "refusals_per_day", "attacks_per_day", "attacks_refused_per_day", "attacks_patch_per_day",
+    "attacks_grudge_per_day", "attacker_win_rate", "fight_death_share", "linearity_h", "linearity_chance", "n_fighters",
+    "corr_selfstatus_strength", "corr_perceived_status_strength", "status_agreement", "mean_memory_size",
+    *[f"expect_{n}_{b}" for n in ("win", "refuse", "attack") for b in ("below", "level", "above", "unknown")],
 ]
 
 
@@ -33,31 +40,36 @@ def parse_value(text: str):
         return text
 
 
-def build_config(sets: list[str], days: float, seed: int) -> Config:
+def build_config(sets: list[str], days: float, seed: int, condition: str = "0") -> Config:
     groups: dict[str, dict] = {}
     for item in sets:
         key, value = item.split("=", 1)
         group, name = key.split(".", 1)
         groups.setdefault(group, {})[name] = parse_value(value)
-    cfg = Config().with_(**groups) if groups else Config()
+    cfg = Config(condition=CONDITIONS[condition])
+    cfg = cfg.with_(**groups) if groups else cfg
     return cfg.with_(sim={"steps": int(days * cfg.world.day_length), "seed": seed})
 
 
-def run_one(args: tuple[list[str], float, int, float]) -> dict:
-    sets, days, seed, burn_in = args
-    sim = Simulation(build_config(sets, days, seed)).run()
-    return summary(sim, burn_in_days=burn_in)
+def run_one(args: tuple[list[str], float, int, float, str]) -> dict:
+    sets, days, seed, burn_in, condition = args
+    sim = Simulation(build_config(sets, days, seed, condition)).run()
+    out = summary(sim, burn_in_days=burn_in)
+    if sim.opinions is not None:
+        out.update(social_summary(sim, burn_in_days=burn_in))
+    return out
 
 
 def report(label: str, results: list[dict]) -> None:
     print(f"\n== {label}  ({len(results)} seeds)")
-    for key in SHOW:
-        vals = np.array([r[key] for r in results], dtype=float)
+    for key in SHOW + (SHOW_SOCIAL if "gives_per_day" in results[0] else []):
+        vals = np.array([r.get(key, np.nan) for r in results], dtype=float)
         print(f"  {key:28s} {np.nanmean(vals):9.3f}  ± {np.nanstd(vals):7.3f}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--condition", default="0", choices=sorted(CONDITIONS))
     ap.add_argument("--seeds", type=int, default=8)
     ap.add_argument("--days", type=float, default=20)
     ap.add_argument("--burn-in", type=float, default=3, help="days excluded from time averages")
@@ -73,8 +85,8 @@ def main() -> None:
 
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         for label, sets in variants:
-            jobs = [(sets, args.days, seed, args.burn_in) for seed in range(args.seeds)]
-            report(label, list(pool.map(run_one, jobs)))
+            jobs = [(sets, args.days, seed, args.burn_in, args.condition) for seed in range(args.seeds)]
+            report(f"condition {args.condition}: {label}", list(pool.map(run_one, jobs)))
 
 
 if __name__ == "__main__":

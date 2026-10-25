@@ -1,6 +1,6 @@
 # Stage 1 calibration: survival world (condition 0)
 
-*2026-10-24. Reproduce with `uv run python scripts/run_stage1.py --seeds 16 --days 60 --burn-in 40`.*
+*2026-10-24. Reproduce with `uv run python scripts/run.py --seeds 16 --days 60 --burn-in 40`.*
 
 ## Targets (spec §11)
 - The population persists, but some agents die.

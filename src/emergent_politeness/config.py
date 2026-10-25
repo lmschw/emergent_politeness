@@ -15,6 +15,7 @@ class WorldParams:
     shelter_radius: float = 4.0
     door_width: float = 1.4
     door_angle: float = 0.0  # radians; door faces +x
+    door_flow: int = 2  # at most this many agents pass the door at once in each direction (turn-taking)
     capacity_base: int = 8  # C0
     capacity_per_level: int = 4  # ΔC
     n_food_patches: int = 6
@@ -26,11 +27,13 @@ class WorldParams:
     material_regrowth: float = 0.03  # calibrated (stage 1); spec guess 0.05
     patch_danger_levels: tuple[float, ...] = (0.0, 0.02, 0.05)  # d_p, sampled per patch; calibrated
     food_spoilage: float = 0.002  # ρ_F
-    integrity_decay: float = 0.001  # δ_I, per step at base size; scales with capacity / C0
+    integrity_decay: float = 0.001  # δ_I, per step at base size
+    decay_scales_with_size: bool = False  # δ_I × C/C0 if True; off by user decision 2026-10-25 (the level cap stops growth)
     maintain_rate: float = 0.01  # r_I
     material_per_maintain_step: float = 0.1  # m_I
     material_per_build_step: float = 0.3  # m_B; calibrated, spec guess 0.1
     build_required: float = 200.0  # B_req: progress for level ℓ→ℓ+1 is B_req·(ℓ+1); calibrated
+    max_level: int = 8  # shelter cannot grow beyond this (capacity C0 + 8·ΔC = 40); user decision
     temp_mean: float = 5.0  # T̄
     temp_amplitude: float = 10.0  # A
     temp_comfort: float = 10.0  # T_comf
@@ -86,6 +89,70 @@ class TaskParams:
 
 
 @dataclass(frozen=True)
+class SocialParams:
+    """Agent-to-agent acts and opinions (spec §5.3, §5.10, §5.11)."""
+
+    # Perception and memory
+    r_see: float = 6.0  # observers of an act must be this close
+    r_act: float = 1.5  # reach for GIVE / ATTACK
+    r_door: float = 2.5  # an idle insider this close to the inner door point can REFUSE_ENTRY
+    attention: float = 0.8  # π_att
+    memory_size: int = 30  # K
+    familiarity_scale: float = 5.0  # F0
+    memory_timescale: float = 2000.0  # T_mem
+    # Built-in affective values v(a) = (e, p), actor → target frame (spec §5.3 table)
+    v_give: tuple[float, float] = (0.6, 0.0)
+    v_refuse_entry: tuple[float, float] = (-0.5, 0.4)
+    v_attack_win: tuple[float, float] = (-0.8, 0.7)
+    v_attack_lose: tuple[float, float] = (-0.8, -0.3)
+    # Affective opinion updates (affect conditions)
+    alpha_E_act: float = 0.15  # α_Eφ
+    alpha_P_act: float = 0.15  # α_Pφ
+    bystander_weight: float = 0.5  # β_by
+    balance_mix: float = 0.5  # λ_b: 0 = image scoring, 1 = balance theory
+    balance_gain: float = 3.0  # γ_b
+    transient_decay: float = 0.3  # ρ_τ
+    self_status_rate: float = 0.03  # ε_S
+    acceptance_rate: float = 0.03  # ε_A
+    self_status_decay: float = 0.001  # ε_dec
+    contribution_E: float = 0.002  # α_C; near zero by user decision (sightings inflated liking)
+    contribution_P: float = 0.002  # α_C'
+    # Learned status expectations (spec §5.3a): per status configuration actor above / level / below target
+    status_bin_width: float = 0.2  # θ_b
+    expectation_rate: float = 0.05  # η_x, delta-rule rate
+    expectation_prior: float = 0.5  # starting value of every expectation (no status effect at first)
+    # Fights (all conditions with physical acts)
+    fight_damage: float = 0.15  # q_f
+    winner_damage_frac: float = 0.3  # ω
+    fight_sharpness: float = 5.0  # β_f
+    winner_loser_self: float = 0.1  # ε_f, scaled by the upset 2·(1 − p̂_win)
+    winner_loser_observer: float = 0.1  # α_f, scaled by the upset
+    # Material ledger (affect-off conditions): E = tanh(L / L0)
+    ledger_scale: float = 5.0  # L0
+    ledger_give: float = 1.0
+    ledger_refuse_entry: float = -0.5
+    ledger_attack: float = -1.0
+    ledger_contribution: float = 0.02  # weight on u_τ when a deposit is seen; scaled down with α_C
+    # Decision weights (logistic), spec §5.3
+    give_bias: float = -2.0  # γ_G0
+    give_liking: float = 2.0  # γ_GE
+    give_need: float = 2.0  # γ_need
+    give_own_hunger: float = 3.0  # γ_own
+    hungry_visible: float = 0.7  # target counts as visibly hungry above this
+    refuse_bias: float = -5.0  # γ_R0; calibrated with learned status + level cap (spec guess −2 caused a feud spiral)
+    refuse_liking: float = 2.0  # γ_RE
+    refuse_crowding: float = 3.0  # γ_C
+    refuse_risk: float = 4.0  # γ_Rrisk: weight on the learned risk of a lost retaliation fight
+    refusal_cooldown: int = 10  # steps a refused agent waits before asking again
+    attack_bias: float = -4.5  # γ_A0; calibrated
+    attack_liking: float = 2.0  # γ_AE
+    attack_expected_win: float = 2.0  # γ_AW: weight on (2·p̂_win − 1), the learned chance of winning
+    attack_hunger: float = 2.0  # γ_AH
+    attack_transient: float = 2.0  # γ_Aτ
+    attack_transient_trigger: float = 0.3  # a transient e below −this toward a neighbour triggers ATTACK
+
+
+@dataclass(frozen=True)
 class PopulationParams:
     n_initial: int = 12  # N0
     arrival_rate: float = 0.005  # λ_arr, newcomers per step
@@ -126,6 +193,7 @@ class Config:
     world: WorldParams = field(default_factory=WorldParams)
     body: BodyParams = field(default_factory=BodyParams)
     tasks: TaskParams = field(default_factory=TaskParams)
+    social: SocialParams = field(default_factory=SocialParams)
     population: PopulationParams = field(default_factory=PopulationParams)
     sim: SimParams = field(default_factory=SimParams)
     condition: Condition = field(default_factory=lambda: CONDITIONS["0"])

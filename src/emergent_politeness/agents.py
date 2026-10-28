@@ -60,7 +60,17 @@ class Agent:
     memory: dict = field(default_factory=dict)  # other id -> social.Impression
     expect: dict = field(default_factory=dict)  # learned status expectations, see social.Opinions
     qmodels: dict = field(default_factory=dict)  # learned returns of acts, see learning.ConsequenceLearner
-    welfare: float = 0.0  # running total of material returns (store food, gifts, refusals, damage)
+    welfare: float = 0.0  # running total of material returns (store food, gifts, refusals, damage, work, talk)
+    welfare_parts: dict = field(default_factory=dict)  # the same total broken down by source (for analysis)
+    paused_until: int = -1  # talking: stands still until this step
+    task_for: int | None = None  # set while doing a task someone asked for (its work is a social cost)
+    lexicon: object = None  # language.Lexicon (stage 4: markers and affect)
+
+    def gain(self, part: str, amount: float, counted: bool = True) -> None:
+        """Book a material return. `counted=False` records it for analysis only (not in welfare)."""
+        self.welfare_parts[part] = self.welfare_parts.get(part, 0.0) + amount
+        if counted:
+            self.welfare += amount
     refused_until: int = -1  # cannot ask to enter again before this step
     refused_by: int | None = None
     refused_at: int = -10**9

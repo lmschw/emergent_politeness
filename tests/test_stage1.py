@@ -17,11 +17,6 @@ def test_config_with_changes_only_named_fields():
     assert new.world.shelter_radius == cfg.world.shelter_radius
 
 
-def test_later_conditions_not_yet_implemented():
-    with pytest.raises(NotImplementedError):
-        Simulation(Config(condition=CONDITIONS["6"]))
-
-
 def test_same_seed_same_run():
     a = Simulation(Config()).run(400)
     b = Simulation(Config()).run(400)

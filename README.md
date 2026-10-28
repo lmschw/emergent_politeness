@@ -4,10 +4,11 @@ An embodied multi-agent simulation in which politeness and rudeness can emerge. 
 
 - Model specification (ODD format): [model_spec.md](model_spec.md)
 - Related work and novelty: [docs/related_work.md](docs/related_work.md)
-- Calibration: [stage 1](docs/calibration_stage1.md), [stage 2](docs/calibration_stage2.md)
+- Calibration: [stage 1](docs/calibration_stage1.md), [stage 2](docs/calibration_stage2.md), [stage 3](docs/calibration_stage3.md), [stage 4](docs/calibration_stage4.md)
+- Built-in assumptions audit: [docs/assumptions_audit.md](docs/assumptions_audit.md)
 
 ## Status
-Stages 1 (survival world, condition 0) and 2 (physical acts, conditions 1 and 4) are implemented and calibrated. Language comes next.
+Stages 1 (survival world, condition 0), 2 (physical acts, conditions 1 and 4) 3 (content language, conditions 2 and 3) and 4 (affect markers, conditions 5 and 6) are implemented (first versions).
 
 ## Usage
 Requires [uv](https://docs.astral.sh/uv/).

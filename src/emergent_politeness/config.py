@@ -147,19 +147,73 @@ class SocialParams:
     hungry_visible: float = 0.7  # a neighbour above this hunger is a gift *opportunity* (no weight on need)
     refusal_cooldown: int = 10  # steps a refused agent waits before asking again
     attack_transient_trigger: float = 0.3  # anger (transient e below −this) toward a neighbour is an opportunity
-    choice_gain: float = 2.0  # β: weight on the learned return difference Q(act) − Q(no act)
-    return_rate: float = 0.05  # η_q, normalised delta rule
+    choice_gain: float = 2.0  # β: weight on the learned advantage of acting
+    return_rate: float = 0.2  # η_q, normalised delta rule; raised from 0.05 (2026-10-27: learning too slow for short lives)
     return_window: int = 300  # steps over which an act's material return is counted
+    # Natural variation in dispositions (option 2, toggle, user 2026-10-27): newcomers start with a small random
+    # learned weight on liking for every act (mean 0: some slightly reciprocal, some slightly spiteful).
+    innate_variation: bool = False
+    innate_sd: float = 0.2
     # Social learning (spec §5.3e, toggle): payoff-biased copying of learned weights ("imitate if better",
     # proportional imitation; Schlag 1998). Success = visible body condition only: health · (1 − hunger).
     social_learning: bool = False
     copy_rate: float = 1 / 300  # chance per step that an agent looks at a random agent in view
     copy_strength: float = 0.2  # μ: how far weights move toward the model's when copying
+    # Which material events count as the return of a decision (spec §5.3d):
+    # "social" = only what others do to me (gifts, refusals, fights, help) plus the direct cost of my own act
+    # (food given, talk, work done for someone else); "all" also counts store food, routine work and injuries.
+    return_mode: str = "social"
+    # Vicarious learning (spec §5.3d; Bandura 1977): also learn from the visible consequences of others'
+    # decisions whose both outcomes are observable (refuse/admit, yes/no to a request, attack after a refusal).
+    vicarious_learning: bool = True
+    vicarious_weight: float = 0.5  # an observed consequence counts this much relative to one's own
+    welfare_help: float = 0.4  # someone doing a task I asked for (≈ the effort of one trip, mirrors the helper's cost)
     # Material return ("welfare") events, in food units, from anyone (direct + indirect reciprocity)
     welfare_store_food: float = 1.0  # eating or taking a ration from the shared store
     welfare_gift: float = 1.0  # receiving (+) or giving away (−) a unit of food
     welfare_refused: float = -0.5  # being refused entry
-    welfare_damage: float = -1.0  # per fight-damage unit q_f taken
+    welfare_damage: float = -1.0  # per fight-damage unit q_f taken (also used for injuries, scaled by q_inj/q_f)
+    welfare_work: float = -0.01  # per working step: effort is a material cost (stage 3; a trip ≈ −0.4)
+    welfare_talk: float = -0.05  # per utterance: talking takes time and effort (≈ 5 working steps)
+    talk_pause_speaker: int = 2  # steps a speaker stands still
+    talk_pause_answer: int = 1  # steps an answering addressee stands still
+    # Language (spec §5.4, stage 3): content only, no markers yet
+    r_hear: float = 3.0  # utterances reach everyone this close to the speaker
+    ask_food_hunger: float = 0.6  # a hungry agent without food has an opportunity to ask for food
+    ask_task_fatigue: float = 0.5  # a tired agent ...
+    ask_task_stimulus: float = 0.5  # ... who sees a pressing task has an opportunity to ask someone to do it
+    v_comply: tuple[float, float] = (0.4, -0.3)  # built-in affective value of complying (spec §5.3 table)
+    v_decline: tuple[float, float] = (-0.3, 0.2)  # ... and of declining (used once affect is on)
+    ledger_comply: float = 0.5  # material ledger value of someone doing a task for me
+    ledger_decline: float = -0.3  # ... and of being turned down
+
+@dataclass(frozen=True)
+class LanguageParams:
+    """Affect markers (spec §5.4–5.8, stage 4; conditions 5 and 6)."""
+
+    n_markers: int = 6  # M
+    max_markers: int = 2  # L_max
+    sigma_c0: float = 0.1  # initial connotations ~ N(0, σ_c0²): no shared meaning at the start
+    eta_c: float = 0.05  # connotation learning (Rescorla–Wagner)
+    eta_norm: float = 0.01  # norm learning
+    eta_q: float = 0.1  # instrumental learning of what gets a yes
+    beta_obs: float = 0.3  # weight of observed (not own) requests in instrumental learning
+    trace_window: int = 10  # W: a speaker's act toward the addressee this soon after a request conditions its markers
+    alpha_E_word: float = 0.05  # α_E for words
+    alpha_P_word: float = 0.05  # α_P for words
+    temperature: float = 0.1  # T_s, softmax over bundles
+    marker_cost: float = 0.05  # κ_B, utility cost per marker
+    marker_talk: float = 0.5  # extra talk cost per marker, as a fraction of welfare_talk (material time cost)
+    # Motive (spec §5.5, user 2026-10-25): "intrinsic" = being liked is valued for its own sake.
+    # "learned" (value of being liked learned from material consequences) is not implemented yet.
+    motive: str = "intrinsic"
+    w_inst: float = 1.0
+    w_img: float = 1.0
+    w_expr: float = 1.0
+    lambda_E0: float = 1.0  # wanting to be liked
+    lambda_P: float = 0.0  # wanting status: off at the start (user decision)
+    kappa_A: float = 1.0  # sociometer: feeling excluded strengthens the wish to be liked
+
 
 @dataclass(frozen=True)
 class PopulationParams:
@@ -174,6 +228,7 @@ class SimParams:
     physics_dt: float = 0.2  # seconds per tick
     seed: int = 0
     record_every: int = 1  # time-series sampling interval
+    log_learning: bool = False  # log every resolved learning decision with its return broken into parts
 
 
 @dataclass(frozen=True)
@@ -203,6 +258,7 @@ class Config:
     body: BodyParams = field(default_factory=BodyParams)
     tasks: TaskParams = field(default_factory=TaskParams)
     social: SocialParams = field(default_factory=SocialParams)
+    language: LanguageParams = field(default_factory=LanguageParams)
     population: PopulationParams = field(default_factory=PopulationParams)
     sim: SimParams = field(default_factory=SimParams)
     condition: Condition = field(default_factory=lambda: CONDITIONS["0"])

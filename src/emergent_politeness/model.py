@@ -16,6 +16,7 @@ from .config import Config
 from .environment import FOOD, MATERIAL, Environment, Patch
 from .events import EventLog
 from .physics import PhysicsWorld
+from .language import Language
 from .learning import ConsequenceLearner
 from .social import Opinions, sigmoid
 
@@ -31,15 +32,15 @@ def dist(p, q) -> float:
 GRANT_TIMEOUT = 30  # decision steps before an unused door grant expires
 QUEUE_JOIN_RADIUS = 6.0  # an agent wanting in joins the entry queue within this distance of the door
 TASK_RESOURCE = {Task.COLLECT_FOOD: FOOD, Task.COLLECT_MATERIAL: MATERIAL}
+# Return parts counted when return_mode == "social": what others do to me, plus the direct cost of my own act
+SOCIAL_PARTS = {"gift_given", "gift_received", "refused", "fight", "talk", "work_for_others", "help_received"}
 
 
 class Simulation:
     def __init__(self, config: Config) -> None:
         c = config.condition
-        if c.language:
-            raise NotImplementedError(
-                f"Condition {c.name!r} needs language (stage 3+); conditions 0, 1 and 4 are implemented."
-            )
+        if config.language.motive != "intrinsic":
+            raise NotImplementedError("motive='learned' is not implemented yet; use 'intrinsic' (spec §5.5).")
         self.cfg = config
         self.rng = np.random.default_rng(config.sim.seed)
         self.env = Environment(config.world, self.rng)
@@ -68,7 +69,17 @@ class Simulation:
         # Stage 2: social acts and opinions. Nothing here touches the RNG in condition 0.
         self.acts_on = c.physical_acts
         self.opinions = Opinions(config.social, c.affect, self.rng) if (c.physical_acts or c.language) else None
-        self.learner = ConsequenceLearner(config.social, self.opinions) if c.physical_acts else None
+        self.learner = ConsequenceLearner(config.social, self.opinions) if (c.physical_acts or c.language) else None
+        self.talk_on = c.language
+        # Stage 4: affect markers in language (conditions 5 and 6)
+        self.lang = Language(config.language, config.social, self.opinions, self.rng) if (c.language and c.affect) else None
+        self.traces: dict[tuple[int, int], tuple[int, tuple, list]] = {}  # (speaker, addressee) -> request markers
+        self._last_bundle: tuple = ()
+        if self.learner is not None and config.sim.log_learning:
+            self.learner.on_resolve = lambda d, r, parts: self.log.log(
+                self.k, "learn", agent=d.agent.id, act=d.act, chosen=d.chosen, decided=d.due - config.social.return_window,
+                ret=round(r, 4), parts={key: round(v, 4) for key, v in parts.items()},
+                f=[round(float(x), 4) for x in d.f])
         self.snapshots: list[dict] = []  # daily opinion snapshots for analysis
         # Refusals awaiting a possible retaliation: (arriver, guard) -> (deadline step, [(observer, bin)])
         self._pending_retaliation: dict[tuple[int, int], tuple[int, list]] = {}
@@ -99,6 +110,11 @@ class Simulation:
             a.expect = self.opinions.new_expectations()
         if self.learner is not None:
             a.qmodels = self.learner.new_models()
+            if self.cfg.social.innate_variation:  # option 2: small random weight on liking, mean 0
+                for w_adv, _ in a.qmodels.values():
+                    w_adv[4] = self.rng.normal(0.0, self.cfg.social.innate_sd)
+        if self.lang is not None:
+            a.lexicon = self.lang.new_lexicon()
         self.agents[a.id] = a
         self.physics.add_agent(a.id, pos)
         a.inside = self.env.shelter.contains(pos)
@@ -254,6 +270,9 @@ class Simulation:
         for _ in range(sp.physics_ticks):
             self._door_traffic()
             for a in self.agents.values():
+                if a.paused_until > self.k:  # talking: stands still
+                    self.physics.set_velocity(a.id, 0.0, 0.0)
+                    continue
                 pos = self.physics.position(a.id)
                 w = self._waypoint(a, pos)
                 dx, dy = w[0] - pos[0], w[1] - pos[1]
@@ -302,6 +321,10 @@ class Simulation:
         # Pushed back in while leaving: harmless as long as there is room.
         return a.id in self.exiting and self.n_inside < self.env.shelter.capacity
 
+    def _book(self, a: Agent, part: str, amount: float) -> None:
+        """Book a material event; whether it counts as a return depends on return_mode (spec §5.3d)."""
+        a.gain(part, amount, counted=self.cfg.social.return_mode == "all" or part in SOCIAL_PARTS)
+
     # ------------------------------------------------------------------
     # Bodies (spec §5.1)
     # ------------------------------------------------------------------
@@ -309,13 +332,15 @@ class Simulation:
         b, sh = self.cfg.body, self.env.shelter
         if a.inside and sh.food >= 1:
             sh.food -= 1
-            a.welfare += self.cfg.social.welfare_store_food
+            self._book(a, "store_food", self.cfg.social.welfare_store_food)
             source = "store"
         elif a.rations > 0:
             a.rations -= 1
+            a.gain("eat_ration", 1.0, counted=False)
             source = "ration"
         elif a.load_kind == FOOD and a.load >= 1:
             a.load -= 1
+            a.gain("eat_load", 1.0, counted=False)
             source = "load"
         else:
             return
@@ -329,6 +354,7 @@ class Simulation:
             self._eat(a)
         if a.working:
             a.fatigue = min(1.0, a.fatigue + b.fatigue_work)
+            self._book(a, "work_for_others" if a.task_for is not None else "work", self.cfg.social.welfare_work)
         elif a.resting:
             a.fatigue = max(0.0, a.fatigue - b.fatigue_rest)
         if a.inside:  # the shelter protects in proportion to its integrity
@@ -381,7 +407,7 @@ class Simulation:
             if a.inside and a.rations < self.cfg.body.max_rations and sh.food >= 1:
                 sh.food -= 1
                 a.rations += 1
-                a.welfare += self.cfg.social.welfare_store_food
+                self._book(a, "store_food", self.cfg.social.welfare_store_food)
                 self.log.log(self.k, "take_ration", agent=a.id)
         elif task in (Task.MAINTAIN, Task.BUILD):
             a.phase = Phase.WORK if a.inside else Phase.OUTBOUND
@@ -396,6 +422,7 @@ class Simulation:
     def _end(self, a: Agent, reason: str) -> None:
         self.log.log(self.k, "task_end", agent=a.id, task=a.task.value, reason=reason)
         a.task, a.phase, a.patch = Task.IDLE, Phase.NONE, None
+        a.task_for = None
 
     def _execute_task(self, a: Agent) -> None:
         sh, b, wp = self.env.shelter, self.cfg.body, self.cfg.world
@@ -412,6 +439,7 @@ class Simulation:
                 if self.rng.random() < patch.danger * (1 + b.injury_fatigue_mult * a.fatigue):
                     a.health -= b.injury_damage
                     a.last_damage = "injury"
+                    self._book(a, "injury", self.cfg.social.welfare_damage * b.injury_damage / self.cfg.social.fight_damage)
                     self.log.log(self.k, "injury", agent=a.id, patch=patch.idx)
                 if a.load >= b.carry_capacity - 1e-9 or patch.stock < 1:
                     a.phase = Phase.RETURN
@@ -512,6 +540,11 @@ class Simulation:
         """Log an act and let everyone nearby update their opinions. `appraise` names the
         expectation table whose surprise scales the affective impact (spec §5.3a)."""
         self.log.log(self.k, "act", act=kind, actor=actor.id, target=target.id, **extra)
+        if self.lang is not None:  # spec §5.7: markers predict what the speaker then does to the addressee
+            trace = self.traces.get((actor.id, target.id))
+            if trace is not None and self.k - trace[0] <= self.cfg.language.trace_window:
+                self.lang.condition([o for o in trace[2] if o.alive], trace[1], value)
+                del self.traces[(actor.id, target.id)]
         if observers is None:
             observers = self._observers(actor, target)
         if target not in observers:
@@ -558,7 +591,7 @@ class Simulation:
             bins_refuse = [op.bin(o, g.id, a.id) for o in observers]
             bins_avenge = [op.bin(o, a.id, g.id) for o in observers]
             if refused:
-                a.welfare += sp.welfare_refused
+                self._book(a, "refused", sp.welfare_refused)
                 a.refused_until = self.k + sp.refusal_cooldown
                 a.refused_by, a.refused_at = g.id, self.k
                 if not a.waiting_at_door:
@@ -571,6 +604,7 @@ class Simulation:
                     self.k + 1, [(o, b) for o, b in zip(observers, bins_avenge) if o is not g])
             for o, b in zip(observers, bins_refuse):
                 op.observe_entry_decision(o, g, a, refused, b)
+            self._vicarious(observers, g, a, "refuse", (carries, a.hunger, crowding), refused, exclude=(a,))
             if refused:
                 return True
         return False
@@ -634,6 +668,9 @@ class Simulation:
             adv = self.learner.advantage(a, "attack", f)
             chosen = self.rng.random() < sigmoid(sp.exploration_bias + sp.choice_gain * adv)
             self.learner.record(a, "attack", f, chosen, self.k)
+            if reason == "refused":  # attacking or walking away after a refusal is visible either way
+                self._vicarious(self._observers(a, t), a, t, "attack",
+                                lambda o: (2 * op.expected_win(o, o.id, t.id) - 1, o.hunger), chosen, exclude=(t,))
             if chosen:
                 return t, reason
         return None
@@ -648,8 +685,8 @@ class Simulation:
         winner, loser = (a, t) if a_wins else (t, a)
         loser.health -= sp.fight_damage
         winner.health -= sp.winner_damage_frac * sp.fight_damage
-        loser.welfare += sp.welfare_damage
-        winner.welfare += sp.welfare_damage * sp.winner_damage_frac
+        self._book(loser, "fight", sp.welfare_damage)
+        self._book(winner, "fight", sp.welfare_damage * sp.winner_damage_frac)
         loser.last_damage = winner.last_damage = "fight"
         value = sp.v_attack_win if a_wins else sp.v_attack_lose
         observers = self._observers(a, t)
@@ -694,13 +731,181 @@ class Simulation:
             a.rations -= 1
             source = "ration"
         t.rations += 1
-        a.welfare -= sp.welfare_gift
-        t.welfare += sp.welfare_gift
+        self._book(a, "gift_given", -sp.welfare_gift)
+        self._book(t, "gift_received", sp.welfare_gift)
         if sp.gift_status:  # option B: the gift asserts standing; its weight depends on its surprise
             value = (sp.v_give[0], sp.gift_status_value)
             self._act(a, t, "give", value, sp.ledger_give, appraise="give", observers=list(context[0]), source=source)
         else:
             self._act(a, t, "give", sp.v_give, sp.ledger_give, source=source)
+
+    # ------------------------------------------------------------------
+    # Language, stage 3 (spec §5.4): requests and responses, content only
+    # ------------------------------------------------------------------
+    def _say(self, speaker: Agent, addressee: Agent, act: str, content: str, **extra) -> list[Agent]:
+        """Log an utterance; return everyone in earshot (speaker and addressee included).
+        Talking costs the speaker time (it stands still) and effort (spec §5.4, talk cost).
+        With markers (stage 4) the speaker chooses a bundle and every hearer appraises it (spec §5.5–5.6)."""
+        sp = self.cfg.social
+        bundle, expected = (), None
+        if self.lang is not None:
+            speech = f"request_{'food' if content == 'food' else 'task'}" if act == "request" else f"respond_{content}"
+            bundle, expected = self.lang.choose(speaker, addressee, speech)
+        self.log.log(self.k, "utterance", speaker=speaker.id, addressee=addressee.id, act=act, content=content,
+                     markers=list(bundle), **extra)
+        record = self.log.records[-1]
+        pause = sp.talk_pause_answer if act == "respond" else sp.talk_pause_speaker
+        speaker.paused_until = max(speaker.paused_until, self.k + pause)
+        self._book(speaker, "talk", sp.welfare_talk * (1 + self.cfg.language.marker_talk * len(bundle)))
+        ps = self.physics.position(speaker.id)
+        hearers = [o for o in self.agents.values() if dist(self.physics.position(o.id), ps) < self.cfg.social.r_hear]
+        if addressee not in hearers:
+            hearers.append(addressee)
+        for o in hearers:  # hearing someone talk makes them familiar
+            if o is not speaker:
+                self.opinions.recall(o, speaker.id, self.k).F += 1
+        if self.lang is not None:
+            record.update(exp_e=round(float(expected[0]), 4), exp_p=round(float(expected[1]), 4),
+                          s_cfg=self.opinions.bin(speaker, speaker.id, addressee.id),
+                          s_liking=round(self.opinions.liking(speaker, addressee.id), 4))
+            d = self.lang.appraise(hearers, speaker, addressee, speech, bundle, self.k)
+            if d is not None:
+                record.update(app_e=round(float(d[0]), 4), app_p=round(float(d[1]), 4),
+                              accidental_rudeness=bool(expected[0] > 0 and d[0] < 0))
+        self._last_bundle = bundle
+        return hearers
+
+    def _choose_addressee(self, a: Agent, act: str, candidates: list[Agent], situation) -> tuple[Agent, np.ndarray]:
+        """Ask whoever the agent has learned is most worth asking (ties broken at random)."""
+        scored = []
+        for t in candidates:
+            f = self.learner.features(a, t, act, situation)
+            scored.append((self.learner.advantage(a, act, f), self.rng.random(), t, f))
+        _, _, t, f = max(scored, key=lambda x: (x[0], x[1]))
+        return t, f
+
+    def _talk(self) -> None:
+        """Each agent not at work may make one request per step; the addressee answers at once."""
+        sp, tp = self.cfg.social, self.cfg.tasks
+        ids = list(self.agents)
+        if len(ids) < 2:
+            return
+        pos = np.array([tuple(self.physics.position(i)) for i in ids])
+        d = np.hypot(pos[:, None, 0] - pos[None, :, 0], pos[:, None, 1] - pos[None, :, 1])
+        stimuli = self._stimuli()
+        busy: set[int] = set()
+        for n in self.rng.permutation(len(ids)):
+            a = self.agents[ids[n]]
+            if a.id in busy or a.phase in (Phase.HARVEST, Phase.WORK):  # hands busy; walking agents can talk
+                continue
+            near = [self.agents[ids[m]] for m in np.flatnonzero(d[n] < sp.r_hear)
+                    if m != n and ids[m] not in busy]
+            has_food = a.rations > 0 or (a.load_kind == FOOD and a.load >= 1)
+            if self.acts_on and a.hunger > sp.ask_food_hunger and not has_food:
+                holders = [t for t in near if t.rations > 0 or (t.load_kind == FOOD and t.load >= 1)]
+                if holders:
+                    t, f = self._choose_addressee(a, "ask_food", holders, (a.hunger,))
+                    if self._decide_learned(a, "ask_food", f):
+                        busy.update((a.id, t.id))
+                        heard = self._say(a, t, "request", "food")
+                        self._remember_request(a, t, heard)
+                        self._answer_food_request(t, a, self._last_bundle, heard)
+                    continue
+            task = max(WORK_TASKS, key=lambda x: stimuli[x])
+            if a.fatigue > sp.ask_task_fatigue and stimuli[task] > sp.ask_task_stimulus:
+                idle = [t for t in near if t.task == Task.IDLE]
+                if idle:
+                    t, f = self._choose_addressee(a, "ask_task", idle, (a.fatigue, stimuli[task]))
+                    if self._decide_learned(a, "ask_task", f):
+                        busy.update((a.id, t.id))
+                        heard = self._say(a, t, "request", task.value)
+                        self._remember_request(a, t, heard)
+                        self._answer_task_request(t, a, task, self._last_bundle, heard)
+
+    def _decide_learned(self, a: Agent, act: str, f: np.ndarray, grounding: float = 0.0) -> bool:
+        sp = self.cfg.social
+        yes = self.rng.random() < sigmoid(sp.exploration_bias + grounding + sp.choice_gain * self.learner.advantage(a, act, f))
+        self.learner.record(a, act, f, yes, self.k)
+        return yes
+
+    def _remember_request(self, asker: Agent, t: Agent, hearers: list[Agent]) -> None:
+        if self.lang is not None and self._last_bundle:
+            self.traces[(asker.id, t.id)] = (self.k, self._last_bundle, hearers)
+
+    def _markers_learned(self, req_bundle: tuple, req_hearers: list[Agent], resp_hearers: list[Agent],
+                         t: Agent, asker: Agent, act: str, yes: bool, value) -> None:
+        """Stage 4: the answer's markers are conditioned on what the answerer does (spec §5.7), and everyone
+        who heard the request learns which markers get a yes (spec §5.8)."""
+        if self.lang is None:
+            return
+        att = self.cfg.social.attention
+        learners = [o for o in resp_hearers if o is t or o is asker or self.rng.random() < att]
+        self.lang.condition(learners, self._last_bundle, value)
+        knowers = [o for o in req_hearers if o.alive and (o is asker or self.rng.random() < att)]
+        self.lang.learn_compliance(knowers, asker, t, act, req_bundle, yes)
+
+    def _answer_food_request(self, t: Agent, asker: Agent, req_bundle: tuple = (), req_hearers=()) -> None:
+        sp = self.cfg.social
+        f = self.learner.features(t, asker, "comply_food", (asker.hunger, t.hunger))
+        adv = self.learner.advantage(t, "comply_food", f)
+        yes = self._decide_learned(t, "comply_food", f, grounding=-sp.give_own_hunger * t.hunger)
+        hearers = self._say(t, asker, "respond", "yes" if yes else "no", request="food",
+                            own_hunger=round(t.hunger, 3), asker_hunger=round(asker.hunger, 3),
+                            cfg=int(f[:4].argmax()), liking=round(float(f[4]), 4), advantage=round(adv, 4))
+        self._vicarious(hearers, t, asker, "comply_food", lambda o: (asker.hunger, o.hunger), yes)
+        value = ((sp.v_give[0], sp.gift_status_value) if sp.gift_status else sp.v_give) if yes else sp.v_decline
+        self._markers_learned(req_bundle, list(req_hearers), hearers, t, asker, "request_food", yes, value)
+        if yes:
+            self._give(t, asker, self._gift_context(t, asker) if sp.gift_status else None)
+        else:
+            self._respond_seen(t, asker, hearers, declined=True)
+
+    def _answer_task_request(self, t: Agent, asker: Agent, task: Task, req_bundle: tuple = (),
+                             req_hearers=()) -> None:
+        danger = 0.0
+        patch = None
+        if task in OUTSIDE_TASKS:
+            patch = self._choose_patch(TASK_RESOURCE[task])
+            danger = patch.danger
+        f = self.learner.features(t, asker, "comply_task", (t.fatigue, danger))
+        adv = self.learner.advantage(t, "comply_task", f)
+        yes = self._decide_learned(t, "comply_task", f)
+        hearers = self._say(t, asker, "respond", "yes" if yes else "no", request=task.value,
+                            own_fatigue=round(t.fatigue, 3), cfg=int(f[:4].argmax()),
+                            liking=round(float(f[4]), 4), advantage=round(adv, 4))
+        self._vicarious(hearers, t, asker, "comply_task", lambda o: (o.fatigue, danger), yes)
+        sp = self.cfg.social
+        self._markers_learned(req_bundle, list(req_hearers), hearers, t, asker, "request_task", yes,
+                              sp.v_comply if yes else sp.v_decline)
+        if yes:
+            self._start(t, task, patch)
+            t.task_for = asker.id  # its work is now a cost of complying
+            self._book(asker, "help_received", self.cfg.social.welfare_help)
+        self._respond_seen(t, asker, hearers, declined=not yes)
+
+    def _respond_seen(self, t: Agent, asker: Agent, hearers: list[Agent], declined: bool) -> None:
+        """Complying with or declining a request is an act that hearers judge (spec §5.3 table)."""
+        sp = self.cfg.social
+        kind = "decline" if declined else "comply"
+        self.log.log(self.k, "act", act=kind, actor=t.id, target=asker.id)
+        value, ledger = (sp.v_decline, sp.ledger_decline) if declined else (sp.v_comply, sp.ledger_comply)
+        for o in hearers:
+            self.opinions.observe_act(o, t, asker, value, ledger, self.k)
+
+    def _vicarious(self, observers: list[Agent], actor: Agent, target: Agent, act: str, situation,
+                   chosen: bool, exclude: tuple = ()) -> None:
+        """Learning from others' experience (spec §5.3d; Bandura 1977): observers of a decision whose
+        outcome is visible either way learn from what then happens to the actor, as if they had been in
+        its place (their own view of the target). `situation` is a tuple or a function of the observer."""
+        sp = self.cfg.social
+        if not sp.vicarious_learning:
+            return
+        for o in observers:
+            if o is actor or o in exclude or not o.qmodels or self.rng.random() >= sp.attention:
+                continue
+            sit = situation(o) if callable(situation) else situation
+            f = self.learner.features(o, target, act, sit)
+            self.learner.record(o, act, f, chosen, self.k, subject=actor, weight=sp.vicarious_weight)
 
     def _social_learning(self) -> None:
         """Payoff-biased copying of learned weights (spec §5.3e): now and then an agent looks at a random
@@ -737,7 +942,9 @@ class Simulation:
                     "acceptance": a.acceptance,
                     "strength": a.strength,
                     "expect": {name: list(v) for name, v in a.expect.items()},
-                    "advantage": {act: list(w[0] - w[1]) for act, w in a.qmodels.items()},
+                    "advantage": {act: list(w[0]) for act, w in a.qmodels.items()},
+                    "connotation": a.lexicon.c.tolist() if a.lexicon is not None else None,
+                    "norm": a.lexicon.norm.tolist() if a.lexicon is not None else None,
                     "memory": {j: (op.liking(a, j), imp.P, imp.F) for j, imp in a.memory.items()},
                 }
                 for a in self.agents.values()
@@ -779,12 +986,14 @@ class Simulation:
             self._execute_task(a)
         self._remove_dead()
         self._spawn_newcomers()
-        # Talk phase: stage 3+.
         for a in self.agents.values():
             self._overrides(a)
+        if self.talk_on:  # talk phase (spec §3, §5.4)
+            self._talk()
         if self.acts_on:
             self._social_acts()
             self._resolve_retaliation()
+        if self.learner is not None:
             self.learner.resolve(self.k)
             if self.cfg.social.social_learning:
                 self._social_learning()

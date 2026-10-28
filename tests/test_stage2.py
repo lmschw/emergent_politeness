@@ -32,12 +32,6 @@ def test_condition0_fingerprint():
     assert sim.log.count("door_blocked") == 44
 
 
-@pytest.mark.parametrize("cond", ["2", "3", "5", "6"])
-def test_language_conditions_not_yet_implemented(cond):
-    with pytest.raises(NotImplementedError):
-        Simulation(Config(condition=CONDITIONS[cond]))
-
-
 def test_ledger_opinions_without_affect():
     op = opinions(affect=False)
     giver, receiver, bystander = agent(0), agent(1), agent(2)
@@ -235,11 +229,13 @@ def test_learner_moves_chosen_prediction_toward_return():
     giver.qmodels = learner.new_models()
     f = learner.features(giver, hungry, "give", (0.9,))
     assert f[UNKNOWN] == 1.0 and f[:4].sum() == 1.0  # one-hot status configuration: a stranger
-    for _ in range(30):  # giving is always followed by a net gain of 2 food units
-        learner.record(giver, "give", f, True, k=0)
-        giver.welfare += 2.0
+    for n in range(200):  # giving is followed by +2, not giving by 0, on top of a drifting baseline
+        drift = -0.05 * n
+        gave = n % 4 == 0  # giving is the rarely chosen option, as in the model
+        learner.record(giver, "give", f, gave, k=0)
+        giver.welfare += drift + (2.0 if gave else 0.0)
         learner.resolve(k=10)
-    assert learner.advantage(giver, "give", f) > 1.5  # acting predicted ~2 better than not acting (0)
+    assert 1.5 < learner.advantage(giver, "give", f) < 2.5  # the advantage survives the drift
 
 
 def test_no_fixed_sign_social_terms_left():

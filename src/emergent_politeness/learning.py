@@ -1,9 +1,12 @@
 """Learned consequences of social acts (spec §5.3d).
 
 No fixed-sign social dispositions: whether giving to, refusing or attacking someone
-pays is learned. At each opportunity an agent compares two linear predictions of
-the *material return* that follows (acting vs not acting) over the next
-`return_window` steps. The return counts everything that happens to the agent in
+pays is learned. At each opportunity an agent uses a learned linear
+*advantage*: how much more material return follows acting than not acting, over
+the next `return_window` steps. The return is modelled as baseline(f) + [acted]·advantage(f),
+and every decision updates both parts. A shared baseline absorbs drift in returns over
+time; learning the two options separately produced a spurious advantage for refusing
+(the rarely chosen option's estimate lagged behind a drifting baseline; 2026-10-27). The return counts everything that happens to the agent in
 that window, from anyone (direct and indirect reciprocity, Trivers 1971; Nowak &
 Sigmund 1998): food from the shared store, gifts received or given away, being
 refused, damage taken. Learning is a normalised delta rule, i.e. a contextual
@@ -33,6 +36,11 @@ FEATURES = {
     "give": COMMON + ("other_hunger",),
     "refuse": COMMON + ("other_carries_food", "other_hunger", "crowding"),
     "attack": COMMON + ("expected_win", "own_hunger"),
+    # Language, stage 3 (spec §5.4): asking and complying are learned the same way
+    "ask_food": COMMON + ("own_hunger",),
+    "comply_food": COMMON + ("other_hunger", "own_hunger"),
+    "ask_task": COMMON + ("own_fatigue", "stimulus"),
+    "comply_task": COMMON + ("own_fatigue", "danger"),
 }
 
 
@@ -44,6 +52,9 @@ class Pending:
     chosen: bool
     f: np.ndarray
     welfare0: float
+    parts0: dict
+    subject: Agent | None = None  # vicarious: whose return is observed (None = the learner's own)
+    weight: float = 1.0
 
 
 class ConsequenceLearner:
@@ -51,10 +62,11 @@ class ConsequenceLearner:
         self.p = p
         self.op = opinions
         self.pending: deque[Pending] = deque()
+        self.on_resolve = None  # optional callback(pending, return, parts delta) for analysis logging
 
     @staticmethod
     def new_models() -> dict[str, list[np.ndarray]]:
-        """Per act: [weights for acting, weights for not acting]."""
+        """Per act: [advantage weights, baseline weights]."""
         return {act: [np.zeros(len(names)), np.zeros(len(names))] for act, names in FEATURES.items()}
 
     def features(self, i: Agent, j: Agent, act: str, situation: tuple[float, ...]) -> np.ndarray:
@@ -66,11 +78,15 @@ class ConsequenceLearner:
         return f
 
     def advantage(self, i: Agent, act: str, f: np.ndarray) -> float:
-        w_act, w_no = i.qmodels[act]
-        return float((w_act - w_no) @ f)
+        return float(i.qmodels[act][0] @ f)
 
-    def record(self, i: Agent, act: str, f: np.ndarray, chosen: bool, k: int) -> None:
-        self.pending.append(Pending(k + self.p.return_window, i, act, chosen, f, i.welfare))
+    def record(self, i: Agent, act: str, f: np.ndarray, chosen: bool, k: int,
+               subject: Agent | None = None, weight: float = 1.0) -> None:
+        """Remember a decision. With `subject`, i learns vicariously from the decision of `subject`
+        (f is i's own view of the situation; the return is what then happens to the subject)."""
+        who = subject or i
+        self.pending.append(Pending(k + self.p.return_window, i, act, chosen, f, who.welfare,
+                                    dict(who.welfare_parts), subject, weight))
 
     @staticmethod
     def success(a: Agent) -> float:
@@ -85,10 +101,10 @@ class ConsequenceLearner:
         if gap <= 0 or rng.random() >= gap:
             return False
         mu = self.p.copy_strength
-        for act, (w_act, w_no) in learner.qmodels.items():
-            m_act, m_no = model.qmodels[act]
-            w_act += mu * (m_act - w_act)
-            w_no += mu * (m_no - w_no)
+        for act, (w_adv, w_base) in learner.qmodels.items():
+            m_adv, m_base = model.qmodels[act]
+            w_adv += mu * (m_adv - w_adv)
+            w_base += mu * (m_base - w_base)
         for name, table in learner.expect.items():
             other = model.expect.get(name)
             if other is not None:
@@ -101,9 +117,18 @@ class ConsequenceLearner:
         p = self.p
         while self.pending and self.pending[0].due <= k:
             d = self.pending.popleft()
-            if not d.agent.alive:
+            who = d.subject or d.agent
+            if not d.agent.alive or not who.alive:
                 continue
-            r = d.agent.welfare - d.welfare0
-            w = d.agent.qmodels[d.act][0 if d.chosen else 1]
-            err = r - float(w @ d.f)
-            w += p.return_rate * err * d.f / (float(d.f @ d.f) + 1e-6)
+            r = who.welfare - d.welfare0
+            if self.on_resolve is not None:
+                parts = {key: v - d.parts0.get(key, 0.0) for key, v in who.welfare_parts.items()
+                         if v != d.parts0.get(key, 0.0)}
+                self.on_resolve(d, r, parts)
+            w_adv, w_base = d.agent.qmodels[d.act]
+            c = 1.0 if d.chosen else 0.0
+            err = r - float(w_base @ d.f) - c * float(w_adv @ d.f)
+            step = d.weight * p.return_rate * err / ((1.0 + c) * float(d.f @ d.f) + 1e-6)  # normalised over [f, c·f]
+            w_base += step * d.f
+            if c:
+                w_adv += step * d.f

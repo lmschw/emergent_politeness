@@ -139,7 +139,13 @@ def social_summary(sim, burn_in_days: float = 2.0) -> dict:
         wins[(w, l)] += 1
     h, n_fighters = linearity(wins)
     deaths = [r for r in sim.log.of_kind("death") if r["step"] >= start]
+    utter = [r for r in sim.log.of_kind("utterance") if r["step"] >= start]
+    requests = Counter(r["content"] if r["content"] == "food" else "task" for r in utter if r["act"] == "request")
+    answers = Counter(r["content"] for r in utter if r["act"] == "respond")
     out = {
+        "food_requests_per_day": requests["food"] / days_kept,
+        "task_requests_per_day": requests["task"] / days_kept,
+        "compliance_rate": answers["yes"] / max(1, answers["yes"] + answers["no"]),
         "gives_per_day": count["give"] / days_kept,
         "refusals_per_day": count["refuse_entry"] / days_kept,
         "attacks_per_day": count["attack"] / days_kept,

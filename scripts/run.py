@@ -26,6 +26,7 @@ SHOW = [
     "work_share_maintain", "work_share_build", "division_of_labour",
 ]
 SHOW_SOCIAL = [
+    "food_requests_per_day", "task_requests_per_day", "compliance_rate",
     "gives_per_day", "refusals_per_day", "attacks_per_day", "attacks_refused_per_day", "attacks_patch_per_day",
     "attacks_grudge_per_day", "attacker_win_rate", "fight_death_share", "linearity_h", "linearity_chance", "n_fighters",
     "corr_selfstatus_strength", "corr_perceived_status_strength", "status_agreement", "mean_memory_size",
